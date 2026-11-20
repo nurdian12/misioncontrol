@@ -109,7 +109,7 @@ index 86a2cdf..e1b2672 100644
    }))))
    return { agents, fetchedAt: new Date().toISOString() }
 diff --git a/server/mission-control.ts b/server/mission-control.ts
-index ba86533..d891740 100644
+index ba86533..53ebcd5 100644
 --- a/server/mission-control.ts
 +++ b/server/mission-control.ts
 @@ -1,5 +1,8 @@
@@ -139,7 +139,7 @@ index ba86533..d891740 100644
  export interface OfficeSnapshot { stations: OfficeStation[]; summary: OfficeSummary; fetchedAt: string }
  export interface OfficeSummary { declared: number; active: number; idle: number; offline: number; unknown: number; gatewaysReachable: number; gatewaysDeclared: number }
  export interface ExplicitOfficeState { station: OfficeStation['name']; state: 'Working' | 'Reviewing' | 'Collaborating'; expiresAt: string }
-@@ -503,11 +508,13 @@ async function read<T>(run: Run, file: string, args: string[], parse: (output: s
+@@ -503,11 +508,15 @@ async function read<T>(run: Run, file: string, args: string[], parse: (output: s
  export const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
  
  export async function collectSnapshot(run: Run = systemRun): Promise<RuntimeSnapshot> {
@@ -152,11 +152,13 @@ index ba86533..d891740 100644
 +    read(run, 'claude', ['--version'], version, 'Unknown'),
    ])
 -  return { profiles, openCode, fetchedAt: new Date().toISOString() }
-+  return { profiles, openCode, claudeCode, fetchedAt: new Date().toISOString() }
++  // On Windows `claude` is often a .cmd shim that cannot be started directly; a session folder is proof enough.
++  const claudeInstalled = claudeCode.availability === 'available' || await stat(path.join(claudeDirectory(), 'projects')).then((info) => info.isDirectory(), () => false)
++  return { profiles, openCode, claudeCode: claudeCode.availability === 'available' || !claudeInstalled ? claudeCode : { availability: 'available', data: 'Claude Code' }, fetchedAt: new Date().toISOString() }
  }
  
  /** Board slugs passed to `hermes kanban --board`: Hermes' own slug rule, never an option. */
-@@ -815,6 +822,31 @@ export async function collectAgentActivity(profiles: readonly string[], run: Run
+@@ -815,6 +824,31 @@ export async function collectAgentActivity(profiles: readonly string[], run: Run
    return { agents, fetchedAt: new Date().toISOString() }
  }
  
@@ -188,7 +190,7 @@ index ba86533..d891740 100644
  // ---------------------------------------------------------------------------
  // Office
  
-@@ -825,6 +857,7 @@ export function agentRoster(runtime: RuntimeSnapshot): AgentSpec[] {
+@@ -825,6 +859,7 @@ export function agentRoster(runtime: RuntimeSnapshot): AgentSpec[] {
    const profiles = runtime.profiles.availability === 'available' ? runtime.profiles.data : []
    const agents: AgentSpec[] = profiles.filter((profile) => PROFILE_NAME.test(profile.name)).map((profile) => ({ id: profile.name, role: 'Hermes profile', profile: profile.name, gateway: profile.gateway, aliases: [profile.name.toLowerCase()] }))
    if (runtime.openCode.availability === 'available' && !agents.some((agent) => agent.id === 'opencode')) agents.push({ id: 'opencode', role: 'OpenCode', aliases: ['opencode', 'open-code'] })
@@ -196,7 +198,7 @@ index ba86533..d891740 100644
    return agents
  }
  
-@@ -889,6 +922,10 @@ export function buildOfficeSummary(stations: OfficeStation[], runtime: RuntimeSn
+@@ -889,6 +924,10 @@ export function buildOfficeSummary(stations: OfficeStation[], runtime: RuntimeSn
  
  function liveState(agent: AgentSpec, snapshot: AgentActivitySnapshot | undefined): { state: OfficeState; probe?: AgentActivity; known: boolean } {
    if (!snapshot) return { state: 'Unknown', known: true }
@@ -207,7 +209,7 @@ index ba86533..d891740 100644
    if (!agent.profile) {
      // OpenCode has no Hermes profile; it counts as working when an agent's recent log shows it being driven.
      const driver = snapshot.agents.find((agent) => agent.mentionsOpenCode)
-@@ -930,9 +967,9 @@ export function buildOfficeSnapshot(runtime: RuntimeSnapshot, board: TaskBoardSn
+@@ -930,9 +969,9 @@ export function buildOfficeSnapshot(runtime: RuntimeSnapshot, board: TaskBoardSn
      const recentActivity = live.probe
        ? live.probe.active ? `${live.probe.label ?? 'Active'}${live.probe.lastSeen ? ` (last log ${live.probe.lastSeen})` : ''}` : `No activity in the last ${ACTIVITY_WINDOW}`
        : activity.sessions.availability === 'unavailable' ? 'Not Available' : collaboration === 'Collaborating' ? 'Attributed active collaboration session' : 'No attributed recent activity'
@@ -219,7 +221,7 @@ index ba86533..d891740 100644
      return {
        id: agent.id,
        name: agent.id,
-@@ -1008,7 +1045,11 @@ export function getUsage(days: number, now = Date.now()): Promise<UsageSnapshot>
+@@ -1008,7 +1047,11 @@ export function getUsage(days: number, now = Date.now()): Promise<UsageSnapshot>
  const logsSource = cachedSource(() => collectLogs(), 5_000)
  const agentActivitySource = cachedSource(async () => {
    const runtime = await getSnapshot()
