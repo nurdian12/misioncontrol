@@ -18,310 +18,310 @@ if (Test-Path "$Dir\.git") {
 }
 
 $patchFile = Join-Path $env:TEMP 'ruang-claude-code.patch'
-$patch = @'
-diff --git a/server/activity-folders.test.ts b/server/activity-folders.test.ts
-index 4ee1c5b..2afe476 100644
---- a/server/activity-folders.test.ts
-+++ b/server/activity-folders.test.ts
-@@ -223,3 +223,22 @@ describe('the Hermes profiles folder', () => {
-     }
-   })
- })
-+
-+describe('Claude Code agent', () => {
-+  it('reports activity only for a transcript written in the last 2 minutes', async () => {
-+    const { mkdtemp, mkdir, writeFile, utimes } = await import('node:fs/promises')
-+    const { tmpdir } = await import('node:os')
-+    const { join } = await import('node:path')
-+    const { collectClaudeCodeActivity } = await import('./mission-control.js')
-+    const dir = await mkdtemp(join(tmpdir(), 'claude-'))
-+    await mkdir(join(dir, 'projects', 'p'), { recursive: true })
-+    const file = join(dir, 'projects', 'p', 's.jsonl')
-+    await writeFile(file, '{}')
-+    const now = Date.now()
-+    await utimes(file, new Date(now - 30_000), new Date(now - 30_000))
-+    expect(await collectClaudeCodeActivity(dir, now)).toBeDefined()
-+    await utimes(file, new Date(now - 600_000), new Date(now - 600_000))
-+    expect(await collectClaudeCodeActivity(dir, now)).toBeUndefined()
-+    expect(await collectClaudeCodeActivity(join(dir, 'missing'), now)).toBeUndefined()
-+  })
-+})
-diff --git a/server/folders.ts b/server/folders.ts
-index 8d3114a..cb5c741 100644
---- a/server/folders.ts
-+++ b/server/folders.ts
-@@ -2,7 +2,7 @@ import { constants } from 'node:fs'
- import { access, open, readdir, realpath, stat } from 'node:fs/promises'
- import { homedir, userInfo } from 'node:os'
- import path from 'node:path'
--import { redactLogLine } from './mission-control.js'
-+import { claudeDirectory, redactLogLine } from './mission-control.js'
- 
- // Read-only browser over each agent's own folder: ~/.hermes/profiles/<name> for Hermes
- // profiles (`default` falls back to ~/.hermes when it has no profiles/default folder) and
-@@ -233,11 +233,12 @@ export async function resolveAgentFolders(profiles: string[], env: NodeJS.Proces
-   const root = hermesRoot(env, home)
-   // Every Hermes profile this machine reports; `default` always exists in Hermes, so it is the
-   // fallback when the profile list cannot be read.
--  const listed = profiles.filter((name) => name !== 'opencode' && PROFILE_NAME.test(name))
-+  const listed = profiles.filter((name) => name !== 'opencode' && name !== 'claude-code' && PROFILE_NAME.test(name))
-   const names = [...new Set(listed.length ? listed : ['default'])]
-   const specs = [
-     ...names.map((profile) => ({ profile, candidates: profile === 'default' ? [path.join(root, 'profiles', 'default'), root] : [path.join(root, 'profiles', profile)] })),
-     { profile: 'opencode', candidates: (env.RUANG_OPENCODE_DIR ?? env.MISSION_CONTROL_OPENCODE_DIR) ? [path.resolve((env.RUANG_OPENCODE_DIR ?? env.MISSION_CONTROL_OPENCODE_DIR)!)] : [path.join(home, '.opencode'), path.join(home, '.config', 'opencode')] },
-+    { profile: 'claude-code', candidates: [claudeDirectory(env, home)] },
-   ]
-   const realRoot = await realpath(root).catch(() => root)
-   const claimed = new Map<string, string>()
-@@ -247,7 +248,7 @@ export async function resolveAgentFolders(profiles: string[], env: NodeJS.Proces
-     const label = spec.profile
-     const base = { profile: spec.profile, label, path: displayPath(directory, home), directory: real ?? directory }
-     // OpenCode is optional: without its folder it is simply not listed.
--    if (!real && spec.profile === 'opencode' && !denied) continue
-+    if (!real && (spec.profile === 'opencode' || spec.profile === 'claude-code') && !denied) continue
-     if (!real) { folders.push({ ...base, available: false, reason: denied ? `Permission denied for "${processUser()}" (a parent folder is not readable)` : 'Folder not found on this machine' }); continue }
-     if (spec.profile !== 'default' && real === realRoot) { folders.push({ ...base, available: false, reason: 'Resolves to the shared Hermes root, not its own folder' }); continue }
-     const owner = claimed.get(real)
-diff --git a/server/memory.ts b/server/memory.ts
-index 86a2cdf..e1b2672 100644
---- a/server/memory.ts
-+++ b/server/memory.ts
-@@ -15,6 +15,7 @@ export const DEFAULT_MEMORY_LIMIT = 2200
- export const DEFAULT_USER_LIMIT = 1375
- const CONTEXT_FILES = ['HERMES.md', '.hermes.md', 'AGENTS.override.md', 'AGENTS.md', 'CLAUDE.md', '.cursorrules']
- const OPENCODE_CONTEXT_FILES = ['AGENTS.md', 'CLAUDE.md']
-+const CLAUDE_CODE_CONTEXT_FILES = ['CLAUDE.md']
- 
- export interface MemoryDocument {
-   name: string
-@@ -47,7 +48,7 @@ export interface AgentMemory {
-   profile: string
-   label: string
-   path: string
--  kind: 'hermes' | 'opencode'
-+  kind: 'hermes' | 'opencode' | 'claude-code'
-   available: boolean
-   reason?: string
-   soul?: MemoryDocument
-@@ -117,9 +118,15 @@ export function parseMemorySettings(configYaml: string | undefined): MemorySetti
-   }
- }
- 
-+const kindOf = (profile: string): AgentMemory['kind'] => profile === 'opencode' ? 'opencode' : profile === 'claude-code' ? 'claude-code' : 'hermes'
-+
- export async function collectAgentMemory(folder: AgentFolder): Promise<AgentMemory> {
-   const base = { profile: folder.profile, label: folder.label, path: folder.path }
--  if (!folder.available) return { ...base, kind: folder.profile === 'opencode' ? 'opencode' : 'hermes', available: false, reason: folder.reason, contextFiles: [] }
-+  if (!folder.available) return { ...base, kind: kindOf(folder.profile), available: false, reason: folder.reason, contextFiles: [] }
-+  if (folder.profile === 'claude-code') {
-+    const contextFiles = (await Promise.all(CLAUDE_CODE_CONTEXT_FILES.map((name) => readDocument(folder, name)))).filter((document) => document.exists)
-+    return { ...base, kind: 'claude-code', available: true, contextFiles }
-+  }
-   if (folder.profile === 'opencode') {
-     const contextFiles = (await Promise.all(OPENCODE_CONTEXT_FILES.map((name) => readDocument(folder, name)))).filter((document) => document.exists)
-     return { ...base, kind: 'opencode', available: true, contextFiles }
-@@ -147,7 +154,7 @@ export async function collectAgentMemory(folder: AgentFolder): Promise<AgentMemo
- export async function collectMemory(folders: AgentFolder[]): Promise<MemorySnapshot> {
-   // One unreadable agent must not take the whole page down.
-   const agents = await Promise.all(folders.map((folder) => collectAgentMemory(folder).catch((error: unknown): AgentMemory => ({
--    profile: folder.profile, label: folder.label, path: folder.path, kind: folder.profile === 'opencode' ? 'opencode' : 'hermes',
-+    profile: folder.profile, label: folder.label, path: folder.path, kind: kindOf(folder.profile),
-     available: false, reason: error instanceof Error ? error.message : 'Could not read this agent.', contextFiles: [],
-   }))))
-   return { agents, fetchedAt: new Date().toISOString() }
-diff --git a/server/mission-control.ts b/server/mission-control.ts
-index ba86533..53ebcd5 100644
---- a/server/mission-control.ts
-+++ b/server/mission-control.ts
-@@ -1,5 +1,8 @@
- import { execFile as execFileCallback } from 'node:child_process'
- import { promisify } from 'node:util'
-+import { readdir, stat } from 'node:fs/promises'
-+import { homedir } from 'node:os'
-+import path from 'node:path'
- 
- const execFile = promisify(execFileCallback)
- const CACHE_MS = 10_000
-@@ -21,6 +24,8 @@ export interface Source<T> {
- export interface RuntimeSnapshot {
-   profiles: Source<Profile[]>
-   openCode: Source<string>
-+  /** Claude Code CLI version; optional so older snapshots stay valid. */
-+  claudeCode?: Source<string>
-   fetchedAt: string
- }
- export interface Task { title: string; status: string; id?: string; assignee?: string; priority?: number; board?: string; /** Belongs to a locked agent (profile lock): the title is withheld. */ private?: boolean }
-@@ -59,7 +64,7 @@ export interface OfficeStation {
- }
- export type ActivityKind = 'chat' | 'cron' | 'tools' | 'thinking'
- export interface AgentActivity { profile: string; availability: Availability; active: boolean; kind?: ActivityKind; label?: string; lastSeen?: string; mentionsOpenCode: boolean }
--export interface AgentActivitySnapshot { agents: AgentActivity[]; fetchedAt: string }
-+export interface AgentActivitySnapshot { agents: AgentActivity[]; /** Claude Code: last write to a session transcript, when it is recent. */ claudeCodeLastSeen?: string; fetchedAt: string }
- export interface OfficeSnapshot { stations: OfficeStation[]; summary: OfficeSummary; fetchedAt: string }
- export interface OfficeSummary { declared: number; active: number; idle: number; offline: number; unknown: number; gatewaysReachable: number; gatewaysDeclared: number }
- export interface ExplicitOfficeState { station: OfficeStation['name']; state: 'Working' | 'Reviewing' | 'Collaborating'; expiresAt: string }
-@@ -503,11 +508,15 @@ async function read<T>(run: Run, file: string, args: string[], parse: (output: s
- export const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
- 
- export async function collectSnapshot(run: Run = systemRun): Promise<RuntimeSnapshot> {
--  const [profiles, openCode] = await Promise.all([
-+  const version = (value: string) => value.trim().split('\n').pop()?.trim() || 'Unknown'
-+  const [profiles, openCode, claudeCode] = await Promise.all([
-     read(run, 'hermes', ['profile', 'list'], parseProfiles, []),
--    read(run, 'opencode', ['--version'], (value) => value.trim().split('\n').pop()?.trim() || 'Unknown', 'Unknown'),
-+    read(run, 'opencode', ['--version'], version, 'Unknown'),
-+    read(run, 'claude', ['--version'], version, 'Unknown'),
-   ])
--  return { profiles, openCode, fetchedAt: new Date().toISOString() }
-+  // On Windows `claude` is often a .cmd shim that cannot be started directly; a session folder is proof enough.
-+  const claudeInstalled = claudeCode.availability === 'available' || await stat(path.join(claudeDirectory(), 'projects')).then((info) => info.isDirectory(), () => false)
-+  return { profiles, openCode, claudeCode: claudeCode.availability === 'available' || !claudeInstalled ? claudeCode : { availability: 'available', data: 'Claude Code' }, fetchedAt: new Date().toISOString() }
- }
- 
- /** Board slugs passed to `hermes kanban --board`: Hermes' own slug rule, never an option. */
-@@ -815,6 +824,31 @@ export async function collectAgentActivity(profiles: readonly string[], run: Run
-   return { agents, fetchedAt: new Date().toISOString() }
- }
- 
-+/** Claude Code config folder: RUANG_CLAUDE_DIR, then CLAUDE_CONFIG_DIR, then ~/.claude. */
-+export function claudeDirectory(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
-+  return path.resolve(env.RUANG_CLAUDE_DIR ?? env.CLAUDE_CONFIG_DIR ?? path.join(home, '.claude'))
-+}
-+
-+const CLAUDE_ACTIVE_MS = 2 * 60_000
-+
-+/** ISO time of the newest Claude Code session transcript write within the last 2 minutes, if any. Reads file times only. */
-+export async function collectClaudeCodeActivity(directory = claudeDirectory(), now = Date.now()): Promise<string | undefined> {
-+  const projects = path.join(directory, 'projects')
-+  let newest = 0
-+  try {
-+    for (const project of await readdir(projects, { withFileTypes: true })) {
-+      if (!project.isDirectory()) continue
-+      const folder = path.join(projects, project.name)
-+      for (const file of await readdir(folder)) {
-+        if (!file.endsWith('.jsonl')) continue
-+        const modified = (await stat(path.join(folder, file)).catch(() => undefined))?.mtimeMs ?? 0
-+        if (modified > newest) newest = modified
-+      }
-+    }
-+  } catch { return undefined }
-+  return newest && now - newest <= CLAUDE_ACTIVE_MS ? new Date(newest).toISOString() : undefined
-+}
-+
- // ---------------------------------------------------------------------------
- // Office
- 
-@@ -825,6 +859,7 @@ export function agentRoster(runtime: RuntimeSnapshot): AgentSpec[] {
-   const profiles = runtime.profiles.availability === 'available' ? runtime.profiles.data : []
-   const agents: AgentSpec[] = profiles.filter((profile) => PROFILE_NAME.test(profile.name)).map((profile) => ({ id: profile.name, role: 'Hermes profile', profile: profile.name, gateway: profile.gateway, aliases: [profile.name.toLowerCase()] }))
-   if (runtime.openCode.availability === 'available' && !agents.some((agent) => agent.id === 'opencode')) agents.push({ id: 'opencode', role: 'OpenCode', aliases: ['opencode', 'open-code'] })
-+  if (runtime.claudeCode?.availability === 'available' && !agents.some((agent) => agent.id === 'claude-code')) agents.push({ id: 'claude-code', role: 'Claude Code', aliases: ['claude-code', 'claude'] })
-   return agents
- }
- 
-@@ -889,6 +924,10 @@ export function buildOfficeSummary(stations: OfficeStation[], runtime: RuntimeSn
- 
- function liveState(agent: AgentSpec, snapshot: AgentActivitySnapshot | undefined): { state: OfficeState; probe?: AgentActivity; known: boolean } {
-   if (!snapshot) return { state: 'Unknown', known: true }
-+  if (agent.id === 'claude-code') {
-+    // Claude Code has no Hermes profile; it works when a session transcript was written to recently.
-+    return { state: snapshot.claudeCodeLastSeen ? 'Working' : 'Unknown', probe: snapshot.claudeCodeLastSeen ? { profile: 'claude-code', availability: 'available', active: true, kind: 'tools', label: 'Coding with Claude Code', lastSeen: snapshot.claudeCodeLastSeen, mentionsOpenCode: false } : undefined, known: true }
-+  }
-   if (!agent.profile) {
-     // OpenCode has no Hermes profile; it counts as working when an agent's recent log shows it being driven.
-     const driver = snapshot.agents.find((agent) => agent.mentionsOpenCode)
-@@ -930,9 +969,9 @@ export function buildOfficeSnapshot(runtime: RuntimeSnapshot, board: TaskBoardSn
-     const recentActivity = live.probe
-       ? live.probe.active ? `${live.probe.label ?? 'Active'}${live.probe.lastSeen ? ` (last log ${live.probe.lastSeen})` : ''}` : `No activity in the last ${ACTIVITY_WINDOW}`
-       : activity.sessions.availability === 'unavailable' ? 'Not Available' : collaboration === 'Collaborating' ? 'Attributed active collaboration session' : 'No attributed recent activity'
--    const runtimeProvenance = agent.profile ? `Gateway ${gateway ?? 'Unknown'} (hermes profile list)` : 'OpenCode version availability is not a state signal'
-+    const runtimeProvenance = agent.profile ? `Gateway ${gateway ?? 'Unknown'} (hermes profile list)` : agent.id === 'claude-code' ? 'Claude Code version availability is not a state signal' : 'OpenCode version availability is not a state signal'
-     const managedIdle = state === 'Idle' ? '; Ruang managed-idle placement policy (not agent-reported presence)' : ''
--    const liveProvenance = options.agentActivity ? `; live activity (${agent.profile ? `hermes -p ${agent.profile} logs/sessions` : 'agent logs mentioning OpenCode'}, last ${ACTIVITY_WINDOW}): ${!agentActivity || !live.known ? 'unavailable' : live.state !== 'Unknown' ? live.probe?.kind ?? 'active' : 'none'}` : ''
-+    const liveProvenance = options.agentActivity ? `; live activity (${agent.profile ? `hermes -p ${agent.profile} logs/sessions` : agent.id === 'claude-code' ? '~/.claude/projects transcripts' : 'agent logs mentioning OpenCode'}, last ${ACTIVITY_WINDOW}): ${!agentActivity || !live.known ? 'unavailable' : live.state !== 'Unknown' ? live.probe?.kind ?? 'active' : 'none'}` : ''
-     return {
-       id: agent.id,
-       name: agent.id,
-@@ -1008,7 +1047,11 @@ export function getUsage(days: number, now = Date.now()): Promise<UsageSnapshot>
- const logsSource = cachedSource(() => collectLogs(), 5_000)
- const agentActivitySource = cachedSource(async () => {
-   const runtime = await getSnapshot()
--  return collectAgentActivity(runtime.profiles.availability === 'available' ? runtime.profiles.data.map((profile) => profile.name) : [])
-+  const [snapshot, claudeCodeLastSeen] = await Promise.all([
-+    collectAgentActivity(runtime.profiles.availability === 'available' ? runtime.profiles.data.map((profile) => profile.name) : []),
-+    runtime.claudeCode?.availability === 'available' ? collectClaudeCodeActivity() : undefined,
-+  ])
-+  return claudeCodeLastSeen ? { ...snapshot, claudeCodeLastSeen } : snapshot
- }, 15_000)
- 
- export function getSnapshot(now = Date.now()): Promise<RuntimeSnapshot> { return runtimeSource(now) }
-diff --git a/src/pages/Agents.tsx b/src/pages/Agents.tsx
-index 0b3a3e6..00c54e8 100644
---- a/src/pages/Agents.tsx
-+++ b/src/pages/Agents.tsx
-@@ -11,11 +11,13 @@ export function Agents({ runtime, pending = false }: { runtime: RuntimeSnapshot
-   if (!runtime || runtime.profiles.availability === 'unavailable') return <><PageTitle eyebrow="CREW" title="Agents"/><EmptyState title="Not Available">The Hermes profile list could not be read. Is <code>hermes</code> on the PATH of the server?</EmptyState></>
-   const states = new Map(office.status === 'ready' ? office.data.stations.map((station) => [station.id, station]) : [])
-   const openCode = runtime.openCode.availability === 'available' ? runtime.openCode.data : undefined
-+  const claudeCode = runtime.claudeCode?.availability === 'available' ? runtime.claudeCode.data : undefined
-   const cards = [
-     ...runtime.profiles.data.map((profile) => ({ id: profile.name, kind: 'Hermes profile', model: profile.model, gateway: profile.gateway })),
-     ...(openCode ? [{ id: 'opencode', kind: 'OpenCode (CLI tool)', model: openCode, gateway: undefined }] : []),
-+    ...(claudeCode ? [{ id: 'claude-code', kind: 'Claude Code (CLI tool)', model: claudeCode, gateway: undefined }] : []),
-   ]
--  return <><PageTitle eyebrow="CREW" title="Agents">Every Hermes profile on this machine (from <code>hermes profile list</code>) is an agent{openCode ? ', plus OpenCode' : ''}. Nothing is configured by hand: new profiles appear here and in the office automatically.</PageTitle>
-+  return <><PageTitle eyebrow="CREW" title="Agents">Every Hermes profile on this machine (from <code>hermes profile list</code>) is an agent{openCode ? ', plus OpenCode' : ''}{claudeCode ? `${openCode ? ' and' : ', plus'} Claude Code` : ''}. Nothing is configured by hand: new profiles appear here and in the office automatically.</PageTitle>
-     <section className="agent-grid">{cards.map((card) => {
-       const station = states.get(card.id)
-       return <article className="agent-card" key={card.id}>
-diff --git a/src/pages/Memory.tsx b/src/pages/Memory.tsx
-index 3a5818f..e938afa 100644
---- a/src/pages/Memory.tsx
-+++ b/src/pages/Memory.tsx
-@@ -97,7 +97,7 @@ export function Memory({ onOpenFolders }: { onOpenFolders?: () => void }) {
-         const peak = Math.max(item.memory?.percent ?? 0, item.user?.percent ?? 0)
-         return <button key={item.profile} role="tab" aria-selected={item.profile === agent.profile} className={`memory-tab${item.profile === agent.profile ? ' active' : ''}`} onClick={() => setSelected(item.profile)} disabled={!item.available && !item.locked}>
-           <span className="folder-glyph small" aria-hidden="true"><PixelCharacter agent={item.profile}/></span>
--          <span><strong>{item.locked ? '🔒 ' : ''}{item.label}</strong><small>{!item.available ? item.reason ?? 'not available' : item.kind === 'opencode' ? `${item.contextFiles.length} rules file(s)` : `${(item.memory?.entries.length ?? 0) + (item.user?.entries.length ?? 0)} entries · ${peak}% peak`}</small></span>
-+          <span><strong>{item.locked ? '🔒 ' : ''}{item.label}</strong><small>{!item.available ? item.reason ?? 'not available' : item.kind !== 'hermes' ? `${item.contextFiles.length} rules file(s)` : `${(item.memory?.entries.length ?? 0) + (item.user?.entries.length ?? 0)} entries · ${peak}% peak`}</small></span>
-         </button>
-       })}</div>
-       <PrivateGate agent={agent.profile}>{agent.locked ? <ProfileUnlock agent={agent.profile}/> : <AgentPanel key={agent.profile} agent={agent} onOpenFolders={onOpenFolders}/>}</PrivateGate>
-diff --git a/src/pages/ProfileLockSettings.tsx b/src/pages/ProfileLockSettings.tsx
-index 9f4a388..afbfcc7 100644
---- a/src/pages/ProfileLockSettings.tsx
-+++ b/src/pages/ProfileLockSettings.tsx
-@@ -15,6 +15,7 @@ export function ProfileLockSettings() {
-   const agents = runtime.status === 'ready' ? [
-     ...(runtime.data.profiles.availability === 'available' ? runtime.data.profiles.data.map((profile) => profile.name) : []),
-     ...(runtime.data.openCode.availability === 'available' ? ['opencode'] : []),
-+    ...(runtime.data.claudeCode?.availability === 'available' ? ['claude-code'] : []),
-   ] : []
-   const finish = (text: string) => () => { setMode('idle'); setMessage(text) }
-   const start = (next: Mode) => () => { setMessage(undefined); setMode(next) }
-diff --git a/src/types.ts b/src/types.ts
-index 0fb2f48..cc314bf 100644
---- a/src/types.ts
-+++ b/src/types.ts
-@@ -5,6 +5,7 @@ export interface RuntimeSnapshot {
-   /** Every Hermes profile is an agent; `gateway` comes from `hermes profile list`. */
-   profiles: Source<{ name: string; model: string; gateway: GatewayState }[]>
-   openCode: Source<string>
-+  claudeCode?: Source<string>
-   fetchedAt: string
- }
- export interface Task { title: string; status: string; id?: string; assignee?: string; priority?: number; board?: string; private?: boolean }
-@@ -118,5 +119,5 @@ export interface TaskDetailSnapshot { task: Source<TaskDetail | null>; fetchedAt
- export interface MemoryDocument { name: string; path: string; exists: boolean; size?: number; modified?: string; chars?: number; content?: string; truncated?: boolean; redactions?: number; error?: string }
- export interface MemoryStore extends MemoryDocument { entries: string[]; limit: number; used: number; percent: number }
- export interface MemorySettings { memoryEnabled: boolean; userProfileEnabled: boolean; writeApproval: boolean; provider?: string; memoryLimit: number; userLimit: number; source: 'config.yaml' | 'defaults' }
--export interface AgentMemory { profile: string; label: string; path: string; kind: 'hermes' | 'opencode'; available: boolean; reason?: string; soul?: MemoryDocument; memory?: MemoryStore; user?: MemoryStore; contextFiles: MemoryDocument[]; settings?: MemorySettings; locked?: boolean }
-+export interface AgentMemory { profile: string; label: string; path: string; kind: 'hermes' | 'opencode' | 'claude-code'; available: boolean; reason?: string; soul?: MemoryDocument; memory?: MemoryStore; user?: MemoryStore; contextFiles: MemoryDocument[]; settings?: MemorySettings; locked?: boolean }
- export interface MemorySnapshot { agents: AgentMemory[]; fetchedAt: string }
-
+# Patch disimpan sebagai base64 (ASCII murni) supaya aman dari masalah encoding file .ps1.
+$patchB64 = @'
+ZGlmZiAtLWdpdCBhL3NlcnZlci9hY3Rpdml0eS1mb2xkZXJzLnRlc3QudHMgYi9zZXJ2ZXIvYWN0aXZpdHktZm9sZGVycy50ZXN0
+LnRzCmluZGV4IDRlZTFjNWIuLjJhZmU0NzYgMTAwNjQ0Ci0tLSBhL3NlcnZlci9hY3Rpdml0eS1mb2xkZXJzLnRlc3QudHMKKysr
+IGIvc2VydmVyL2FjdGl2aXR5LWZvbGRlcnMudGVzdC50cwpAQCAtMjIzLDMgKzIyMywyMiBAQCBkZXNjcmliZSgndGhlIEhlcm1l
+cyBwcm9maWxlcyBmb2xkZXInLCAoKSA9PiB7CiAgICAgfQogICB9KQogfSkKKworZGVzY3JpYmUoJ0NsYXVkZSBDb2RlIGFnZW50
+JywgKCkgPT4geworICBpdCgncmVwb3J0cyBhY3Rpdml0eSBvbmx5IGZvciBhIHRyYW5zY3JpcHQgd3JpdHRlbiBpbiB0aGUgbGFz
+dCAyIG1pbnV0ZXMnLCBhc3luYyAoKSA9PiB7CisgICAgY29uc3QgeyBta2R0ZW1wLCBta2Rpciwgd3JpdGVGaWxlLCB1dGltZXMg
+fSA9IGF3YWl0IGltcG9ydCgnbm9kZTpmcy9wcm9taXNlcycpCisgICAgY29uc3QgeyB0bXBkaXIgfSA9IGF3YWl0IGltcG9ydCgn
+bm9kZTpvcycpCisgICAgY29uc3QgeyBqb2luIH0gPSBhd2FpdCBpbXBvcnQoJ25vZGU6cGF0aCcpCisgICAgY29uc3QgeyBjb2xs
+ZWN0Q2xhdWRlQ29kZUFjdGl2aXR5IH0gPSBhd2FpdCBpbXBvcnQoJy4vbWlzc2lvbi1jb250cm9sLmpzJykKKyAgICBjb25zdCBk
+aXIgPSBhd2FpdCBta2R0ZW1wKGpvaW4odG1wZGlyKCksICdjbGF1ZGUtJykpCisgICAgYXdhaXQgbWtkaXIoam9pbihkaXIsICdw
+cm9qZWN0cycsICdwJyksIHsgcmVjdXJzaXZlOiB0cnVlIH0pCisgICAgY29uc3QgZmlsZSA9IGpvaW4oZGlyLCAncHJvamVjdHMn
+LCAncCcsICdzLmpzb25sJykKKyAgICBhd2FpdCB3cml0ZUZpbGUoZmlsZSwgJ3t9JykKKyAgICBjb25zdCBub3cgPSBEYXRlLm5v
+dygpCisgICAgYXdhaXQgdXRpbWVzKGZpbGUsIG5ldyBEYXRlKG5vdyAtIDMwXzAwMCksIG5ldyBEYXRlKG5vdyAtIDMwXzAwMCkp
+CisgICAgZXhwZWN0KGF3YWl0IGNvbGxlY3RDbGF1ZGVDb2RlQWN0aXZpdHkoZGlyLCBub3cpKS50b0JlRGVmaW5lZCgpCisgICAg
+YXdhaXQgdXRpbWVzKGZpbGUsIG5ldyBEYXRlKG5vdyAtIDYwMF8wMDApLCBuZXcgRGF0ZShub3cgLSA2MDBfMDAwKSkKKyAgICBl
+eHBlY3QoYXdhaXQgY29sbGVjdENsYXVkZUNvZGVBY3Rpdml0eShkaXIsIG5vdykpLnRvQmVVbmRlZmluZWQoKQorICAgIGV4cGVj
+dChhd2FpdCBjb2xsZWN0Q2xhdWRlQ29kZUFjdGl2aXR5KGpvaW4oZGlyLCAnbWlzc2luZycpLCBub3cpKS50b0JlVW5kZWZpbmVk
+KCkKKyAgfSkKK30pCmRpZmYgLS1naXQgYS9zZXJ2ZXIvZm9sZGVycy50cyBiL3NlcnZlci9mb2xkZXJzLnRzCmluZGV4IDhkMzEx
+NGEuLmNiNWM3NDEgMTAwNjQ0Ci0tLSBhL3NlcnZlci9mb2xkZXJzLnRzCisrKyBiL3NlcnZlci9mb2xkZXJzLnRzCkBAIC0yLDcg
+KzIsNyBAQCBpbXBvcnQgeyBjb25zdGFudHMgfSBmcm9tICdub2RlOmZzJwogaW1wb3J0IHsgYWNjZXNzLCBvcGVuLCByZWFkZGly
+LCByZWFscGF0aCwgc3RhdCB9IGZyb20gJ25vZGU6ZnMvcHJvbWlzZXMnCiBpbXBvcnQgeyBob21lZGlyLCB1c2VySW5mbyB9IGZy
+b20gJ25vZGU6b3MnCiBpbXBvcnQgcGF0aCBmcm9tICdub2RlOnBhdGgnCi1pbXBvcnQgeyByZWRhY3RMb2dMaW5lIH0gZnJvbSAn
+Li9taXNzaW9uLWNvbnRyb2wuanMnCitpbXBvcnQgeyBjbGF1ZGVEaXJlY3RvcnksIHJlZGFjdExvZ0xpbmUgfSBmcm9tICcuL21p
+c3Npb24tY29udHJvbC5qcycKIAogLy8gUmVhZC1vbmx5IGJyb3dzZXIgb3ZlciBlYWNoIGFnZW50J3Mgb3duIGZvbGRlcjogfi8u
+aGVybWVzL3Byb2ZpbGVzLzxuYW1lPiBmb3IgSGVybWVzCiAvLyBwcm9maWxlcyAoYGRlZmF1bHRgIGZhbGxzIGJhY2sgdG8gfi8u
+aGVybWVzIHdoZW4gaXQgaGFzIG5vIHByb2ZpbGVzL2RlZmF1bHQgZm9sZGVyKSBhbmQKQEAgLTIzMywxMSArMjMzLDEyIEBAIGV4
+cG9ydCBhc3luYyBmdW5jdGlvbiByZXNvbHZlQWdlbnRGb2xkZXJzKHByb2ZpbGVzOiBzdHJpbmdbXSwgZW52OiBOb2RlSlMuUHJv
+Y2VzCiAgIGNvbnN0IHJvb3QgPSBoZXJtZXNSb290KGVudiwgaG9tZSkKICAgLy8gRXZlcnkgSGVybWVzIHByb2ZpbGUgdGhpcyBt
+YWNoaW5lIHJlcG9ydHM7IGBkZWZhdWx0YCBhbHdheXMgZXhpc3RzIGluIEhlcm1lcywgc28gaXQgaXMgdGhlCiAgIC8vIGZhbGxi
+YWNrIHdoZW4gdGhlIHByb2ZpbGUgbGlzdCBjYW5ub3QgYmUgcmVhZC4KLSAgY29uc3QgbGlzdGVkID0gcHJvZmlsZXMuZmlsdGVy
+KChuYW1lKSA9PiBuYW1lICE9PSAnb3BlbmNvZGUnICYmIFBST0ZJTEVfTkFNRS50ZXN0KG5hbWUpKQorICBjb25zdCBsaXN0ZWQg
+PSBwcm9maWxlcy5maWx0ZXIoKG5hbWUpID0+IG5hbWUgIT09ICdvcGVuY29kZScgJiYgbmFtZSAhPT0gJ2NsYXVkZS1jb2RlJyAm
+JiBQUk9GSUxFX05BTUUudGVzdChuYW1lKSkKICAgY29uc3QgbmFtZXMgPSBbLi4ubmV3IFNldChsaXN0ZWQubGVuZ3RoID8gbGlz
+dGVkIDogWydkZWZhdWx0J10pXQogICBjb25zdCBzcGVjcyA9IFsKICAgICAuLi5uYW1lcy5tYXAoKHByb2ZpbGUpID0+ICh7IHBy
+b2ZpbGUsIGNhbmRpZGF0ZXM6IHByb2ZpbGUgPT09ICdkZWZhdWx0JyA/IFtwYXRoLmpvaW4ocm9vdCwgJ3Byb2ZpbGVzJywgJ2Rl
+ZmF1bHQnKSwgcm9vdF0gOiBbcGF0aC5qb2luKHJvb3QsICdwcm9maWxlcycsIHByb2ZpbGUpXSB9KSksCiAgICAgeyBwcm9maWxl
+OiAnb3BlbmNvZGUnLCBjYW5kaWRhdGVzOiAoZW52LlJVQU5HX09QRU5DT0RFX0RJUiA/PyBlbnYuTUlTU0lPTl9DT05UUk9MX09Q
+RU5DT0RFX0RJUikgPyBbcGF0aC5yZXNvbHZlKChlbnYuUlVBTkdfT1BFTkNPREVfRElSID8/IGVudi5NSVNTSU9OX0NPTlRST0xf
+T1BFTkNPREVfRElSKSEpXSA6IFtwYXRoLmpvaW4oaG9tZSwgJy5vcGVuY29kZScpLCBwYXRoLmpvaW4oaG9tZSwgJy5jb25maWcn
+LCAnb3BlbmNvZGUnKV0gfSwKKyAgICB7IHByb2ZpbGU6ICdjbGF1ZGUtY29kZScsIGNhbmRpZGF0ZXM6IFtjbGF1ZGVEaXJlY3Rv
+cnkoZW52LCBob21lKV0gfSwKICAgXQogICBjb25zdCByZWFsUm9vdCA9IGF3YWl0IHJlYWxwYXRoKHJvb3QpLmNhdGNoKCgpID0+
+IHJvb3QpCiAgIGNvbnN0IGNsYWltZWQgPSBuZXcgTWFwPHN0cmluZywgc3RyaW5nPigpCkBAIC0yNDcsNyArMjQ4LDcgQEAgZXhw
+b3J0IGFzeW5jIGZ1bmN0aW9uIHJlc29sdmVBZ2VudEZvbGRlcnMocHJvZmlsZXM6IHN0cmluZ1tdLCBlbnY6IE5vZGVKUy5Qcm9j
+ZXMKICAgICBjb25zdCBsYWJlbCA9IHNwZWMucHJvZmlsZQogICAgIGNvbnN0IGJhc2UgPSB7IHByb2ZpbGU6IHNwZWMucHJvZmls
+ZSwgbGFiZWwsIHBhdGg6IGRpc3BsYXlQYXRoKGRpcmVjdG9yeSwgaG9tZSksIGRpcmVjdG9yeTogcmVhbCA/PyBkaXJlY3Rvcnkg
+fQogICAgIC8vIE9wZW5Db2RlIGlzIG9wdGlvbmFsOiB3aXRob3V0IGl0cyBmb2xkZXIgaXQgaXMgc2ltcGx5IG5vdCBsaXN0ZWQu
+Ci0gICAgaWYgKCFyZWFsICYmIHNwZWMucHJvZmlsZSA9PT0gJ29wZW5jb2RlJyAmJiAhZGVuaWVkKSBjb250aW51ZQorICAgIGlm
+ICghcmVhbCAmJiAoc3BlYy5wcm9maWxlID09PSAnb3BlbmNvZGUnIHx8IHNwZWMucHJvZmlsZSA9PT0gJ2NsYXVkZS1jb2RlJykg
+JiYgIWRlbmllZCkgY29udGludWUKICAgICBpZiAoIXJlYWwpIHsgZm9sZGVycy5wdXNoKHsgLi4uYmFzZSwgYXZhaWxhYmxlOiBm
+YWxzZSwgcmVhc29uOiBkZW5pZWQgPyBgUGVybWlzc2lvbiBkZW5pZWQgZm9yICIke3Byb2Nlc3NVc2VyKCl9IiAoYSBwYXJlbnQg
+Zm9sZGVyIGlzIG5vdCByZWFkYWJsZSlgIDogJ0ZvbGRlciBub3QgZm91bmQgb24gdGhpcyBtYWNoaW5lJyB9KTsgY29udGludWUg
+fQogICAgIGlmIChzcGVjLnByb2ZpbGUgIT09ICdkZWZhdWx0JyAmJiByZWFsID09PSByZWFsUm9vdCkgeyBmb2xkZXJzLnB1c2go
+eyAuLi5iYXNlLCBhdmFpbGFibGU6IGZhbHNlLCByZWFzb246ICdSZXNvbHZlcyB0byB0aGUgc2hhcmVkIEhlcm1lcyByb290LCBu
+b3QgaXRzIG93biBmb2xkZXInIH0pOyBjb250aW51ZSB9CiAgICAgY29uc3Qgb3duZXIgPSBjbGFpbWVkLmdldChyZWFsKQpkaWZm
+IC0tZ2l0IGEvc2VydmVyL21lbW9yeS50cyBiL3NlcnZlci9tZW1vcnkudHMKaW5kZXggODZhMmNkZi4uZTFiMjY3MiAxMDA2NDQK
+LS0tIGEvc2VydmVyL21lbW9yeS50cworKysgYi9zZXJ2ZXIvbWVtb3J5LnRzCkBAIC0xNSw2ICsxNSw3IEBAIGV4cG9ydCBjb25z
+dCBERUZBVUxUX01FTU9SWV9MSU1JVCA9IDIyMDAKIGV4cG9ydCBjb25zdCBERUZBVUxUX1VTRVJfTElNSVQgPSAxMzc1CiBjb25z
+dCBDT05URVhUX0ZJTEVTID0gWydIRVJNRVMubWQnLCAnLmhlcm1lcy5tZCcsICdBR0VOVFMub3ZlcnJpZGUubWQnLCAnQUdFTlRT
+Lm1kJywgJ0NMQVVERS5tZCcsICcuY3Vyc29ycnVsZXMnXQogY29uc3QgT1BFTkNPREVfQ09OVEVYVF9GSUxFUyA9IFsnQUdFTlRT
+Lm1kJywgJ0NMQVVERS5tZCddCitjb25zdCBDTEFVREVfQ09ERV9DT05URVhUX0ZJTEVTID0gWydDTEFVREUubWQnXQogCiBleHBv
+cnQgaW50ZXJmYWNlIE1lbW9yeURvY3VtZW50IHsKICAgbmFtZTogc3RyaW5nCkBAIC00Nyw3ICs0OCw3IEBAIGV4cG9ydCBpbnRl
+cmZhY2UgQWdlbnRNZW1vcnkgewogICBwcm9maWxlOiBzdHJpbmcKICAgbGFiZWw6IHN0cmluZwogICBwYXRoOiBzdHJpbmcKLSAg
+a2luZDogJ2hlcm1lcycgfCAnb3BlbmNvZGUnCisgIGtpbmQ6ICdoZXJtZXMnIHwgJ29wZW5jb2RlJyB8ICdjbGF1ZGUtY29kZScK
+ICAgYXZhaWxhYmxlOiBib29sZWFuCiAgIHJlYXNvbj86IHN0cmluZwogICBzb3VsPzogTWVtb3J5RG9jdW1lbnQKQEAgLTExNyw5
+ICsxMTgsMTUgQEAgZXhwb3J0IGZ1bmN0aW9uIHBhcnNlTWVtb3J5U2V0dGluZ3MoY29uZmlnWWFtbDogc3RyaW5nIHwgdW5kZWZp
+bmVkKTogTWVtb3J5U2V0dGkKICAgfQogfQogCitjb25zdCBraW5kT2YgPSAocHJvZmlsZTogc3RyaW5nKTogQWdlbnRNZW1vcnlb
+J2tpbmQnXSA9PiBwcm9maWxlID09PSAnb3BlbmNvZGUnID8gJ29wZW5jb2RlJyA6IHByb2ZpbGUgPT09ICdjbGF1ZGUtY29kZScg
+PyAnY2xhdWRlLWNvZGUnIDogJ2hlcm1lcycKKwogZXhwb3J0IGFzeW5jIGZ1bmN0aW9uIGNvbGxlY3RBZ2VudE1lbW9yeShmb2xk
+ZXI6IEFnZW50Rm9sZGVyKTogUHJvbWlzZTxBZ2VudE1lbW9yeT4gewogICBjb25zdCBiYXNlID0geyBwcm9maWxlOiBmb2xkZXIu
+cHJvZmlsZSwgbGFiZWw6IGZvbGRlci5sYWJlbCwgcGF0aDogZm9sZGVyLnBhdGggfQotICBpZiAoIWZvbGRlci5hdmFpbGFibGUp
+IHJldHVybiB7IC4uLmJhc2UsIGtpbmQ6IGZvbGRlci5wcm9maWxlID09PSAnb3BlbmNvZGUnID8gJ29wZW5jb2RlJyA6ICdoZXJt
+ZXMnLCBhdmFpbGFibGU6IGZhbHNlLCByZWFzb246IGZvbGRlci5yZWFzb24sIGNvbnRleHRGaWxlczogW10gfQorICBpZiAoIWZv
+bGRlci5hdmFpbGFibGUpIHJldHVybiB7IC4uLmJhc2UsIGtpbmQ6IGtpbmRPZihmb2xkZXIucHJvZmlsZSksIGF2YWlsYWJsZTog
+ZmFsc2UsIHJlYXNvbjogZm9sZGVyLnJlYXNvbiwgY29udGV4dEZpbGVzOiBbXSB9CisgIGlmIChmb2xkZXIucHJvZmlsZSA9PT0g
+J2NsYXVkZS1jb2RlJykgeworICAgIGNvbnN0IGNvbnRleHRGaWxlcyA9IChhd2FpdCBQcm9taXNlLmFsbChDTEFVREVfQ09ERV9D
+T05URVhUX0ZJTEVTLm1hcCgobmFtZSkgPT4gcmVhZERvY3VtZW50KGZvbGRlciwgbmFtZSkpKSkuZmlsdGVyKChkb2N1bWVudCkg
+PT4gZG9jdW1lbnQuZXhpc3RzKQorICAgIHJldHVybiB7IC4uLmJhc2UsIGtpbmQ6ICdjbGF1ZGUtY29kZScsIGF2YWlsYWJsZTog
+dHJ1ZSwgY29udGV4dEZpbGVzIH0KKyAgfQogICBpZiAoZm9sZGVyLnByb2ZpbGUgPT09ICdvcGVuY29kZScpIHsKICAgICBjb25z
+dCBjb250ZXh0RmlsZXMgPSAoYXdhaXQgUHJvbWlzZS5hbGwoT1BFTkNPREVfQ09OVEVYVF9GSUxFUy5tYXAoKG5hbWUpID0+IHJl
+YWREb2N1bWVudChmb2xkZXIsIG5hbWUpKSkpLmZpbHRlcigoZG9jdW1lbnQpID0+IGRvY3VtZW50LmV4aXN0cykKICAgICByZXR1
+cm4geyAuLi5iYXNlLCBraW5kOiAnb3BlbmNvZGUnLCBhdmFpbGFibGU6IHRydWUsIGNvbnRleHRGaWxlcyB9CkBAIC0xNDcsNyAr
+MTU0LDcgQEAgZXhwb3J0IGFzeW5jIGZ1bmN0aW9uIGNvbGxlY3RBZ2VudE1lbW9yeShmb2xkZXI6IEFnZW50Rm9sZGVyKTogUHJv
+bWlzZTxBZ2VudE1lbW8KIGV4cG9ydCBhc3luYyBmdW5jdGlvbiBjb2xsZWN0TWVtb3J5KGZvbGRlcnM6IEFnZW50Rm9sZGVyW10p
+OiBQcm9taXNlPE1lbW9yeVNuYXBzaG90PiB7CiAgIC8vIE9uZSB1bnJlYWRhYmxlIGFnZW50IG11c3Qgbm90IHRha2UgdGhlIHdo
+b2xlIHBhZ2UgZG93bi4KICAgY29uc3QgYWdlbnRzID0gYXdhaXQgUHJvbWlzZS5hbGwoZm9sZGVycy5tYXAoKGZvbGRlcikgPT4g
+Y29sbGVjdEFnZW50TWVtb3J5KGZvbGRlcikuY2F0Y2goKGVycm9yOiB1bmtub3duKTogQWdlbnRNZW1vcnkgPT4gKHsKLSAgICBw
+cm9maWxlOiBmb2xkZXIucHJvZmlsZSwgbGFiZWw6IGZvbGRlci5sYWJlbCwgcGF0aDogZm9sZGVyLnBhdGgsIGtpbmQ6IGZvbGRl
+ci5wcm9maWxlID09PSAnb3BlbmNvZGUnID8gJ29wZW5jb2RlJyA6ICdoZXJtZXMnLAorICAgIHByb2ZpbGU6IGZvbGRlci5wcm9m
+aWxlLCBsYWJlbDogZm9sZGVyLmxhYmVsLCBwYXRoOiBmb2xkZXIucGF0aCwga2luZDoga2luZE9mKGZvbGRlci5wcm9maWxlKSwK
+ICAgICBhdmFpbGFibGU6IGZhbHNlLCByZWFzb246IGVycm9yIGluc3RhbmNlb2YgRXJyb3IgPyBlcnJvci5tZXNzYWdlIDogJ0Nv
+dWxkIG5vdCByZWFkIHRoaXMgYWdlbnQuJywgY29udGV4dEZpbGVzOiBbXSwKICAgfSkpKSkKICAgcmV0dXJuIHsgYWdlbnRzLCBm
+ZXRjaGVkQXQ6IG5ldyBEYXRlKCkudG9JU09TdHJpbmcoKSB9CmRpZmYgLS1naXQgYS9zZXJ2ZXIvbWlzc2lvbi1jb250cm9sLnRz
+IGIvc2VydmVyL21pc3Npb24tY29udHJvbC50cwppbmRleCBiYTg2NTMzLi41M2ViY2Q1IDEwMDY0NAotLS0gYS9zZXJ2ZXIvbWlz
+c2lvbi1jb250cm9sLnRzCisrKyBiL3NlcnZlci9taXNzaW9uLWNvbnRyb2wudHMKQEAgLTEsNSArMSw4IEBACiBpbXBvcnQgeyBl
+eGVjRmlsZSBhcyBleGVjRmlsZUNhbGxiYWNrIH0gZnJvbSAnbm9kZTpjaGlsZF9wcm9jZXNzJwogaW1wb3J0IHsgcHJvbWlzaWZ5
+IH0gZnJvbSAnbm9kZTp1dGlsJworaW1wb3J0IHsgcmVhZGRpciwgc3RhdCB9IGZyb20gJ25vZGU6ZnMvcHJvbWlzZXMnCitpbXBv
+cnQgeyBob21lZGlyIH0gZnJvbSAnbm9kZTpvcycKK2ltcG9ydCBwYXRoIGZyb20gJ25vZGU6cGF0aCcKIAogY29uc3QgZXhlY0Zp
+bGUgPSBwcm9taXNpZnkoZXhlY0ZpbGVDYWxsYmFjaykKIGNvbnN0IENBQ0hFX01TID0gMTBfMDAwCkBAIC0yMSw2ICsyNCw4IEBA
+IGV4cG9ydCBpbnRlcmZhY2UgU291cmNlPFQ+IHsKIGV4cG9ydCBpbnRlcmZhY2UgUnVudGltZVNuYXBzaG90IHsKICAgcHJvZmls
+ZXM6IFNvdXJjZTxQcm9maWxlW10+CiAgIG9wZW5Db2RlOiBTb3VyY2U8c3RyaW5nPgorICAvKiogQ2xhdWRlIENvZGUgQ0xJIHZl
+cnNpb247IG9wdGlvbmFsIHNvIG9sZGVyIHNuYXBzaG90cyBzdGF5IHZhbGlkLiAqLworICBjbGF1ZGVDb2RlPzogU291cmNlPHN0
+cmluZz4KICAgZmV0Y2hlZEF0OiBzdHJpbmcKIH0KIGV4cG9ydCBpbnRlcmZhY2UgVGFzayB7IHRpdGxlOiBzdHJpbmc7IHN0YXR1
+czogc3RyaW5nOyBpZD86IHN0cmluZzsgYXNzaWduZWU/OiBzdHJpbmc7IHByaW9yaXR5PzogbnVtYmVyOyBib2FyZD86IHN0cmlu
+ZzsgLyoqIEJlbG9uZ3MgdG8gYSBsb2NrZWQgYWdlbnQgKHByb2ZpbGUgbG9jayk6IHRoZSB0aXRsZSBpcyB3aXRoaGVsZC4gKi8g
+cHJpdmF0ZT86IGJvb2xlYW4gfQpAQCAtNTksNyArNjQsNyBAQCBleHBvcnQgaW50ZXJmYWNlIE9mZmljZVN0YXRpb24gewogfQog
+ZXhwb3J0IHR5cGUgQWN0aXZpdHlLaW5kID0gJ2NoYXQnIHwgJ2Nyb24nIHwgJ3Rvb2xzJyB8ICd0aGlua2luZycKIGV4cG9ydCBp
+bnRlcmZhY2UgQWdlbnRBY3Rpdml0eSB7IHByb2ZpbGU6IHN0cmluZzsgYXZhaWxhYmlsaXR5OiBBdmFpbGFiaWxpdHk7IGFjdGl2
+ZTogYm9vbGVhbjsga2luZD86IEFjdGl2aXR5S2luZDsgbGFiZWw/OiBzdHJpbmc7IGxhc3RTZWVuPzogc3RyaW5nOyBtZW50aW9u
+c09wZW5Db2RlOiBib29sZWFuIH0KLWV4cG9ydCBpbnRlcmZhY2UgQWdlbnRBY3Rpdml0eVNuYXBzaG90IHsgYWdlbnRzOiBBZ2Vu
+dEFjdGl2aXR5W107IGZldGNoZWRBdDogc3RyaW5nIH0KK2V4cG9ydCBpbnRlcmZhY2UgQWdlbnRBY3Rpdml0eVNuYXBzaG90IHsg
+YWdlbnRzOiBBZ2VudEFjdGl2aXR5W107IC8qKiBDbGF1ZGUgQ29kZTogbGFzdCB3cml0ZSB0byBhIHNlc3Npb24gdHJhbnNjcmlw
+dCwgd2hlbiBpdCBpcyByZWNlbnQuICovIGNsYXVkZUNvZGVMYXN0U2Vlbj86IHN0cmluZzsgZmV0Y2hlZEF0OiBzdHJpbmcgfQog
+ZXhwb3J0IGludGVyZmFjZSBPZmZpY2VTbmFwc2hvdCB7IHN0YXRpb25zOiBPZmZpY2VTdGF0aW9uW107IHN1bW1hcnk6IE9mZmlj
+ZVN1bW1hcnk7IGZldGNoZWRBdDogc3RyaW5nIH0KIGV4cG9ydCBpbnRlcmZhY2UgT2ZmaWNlU3VtbWFyeSB7IGRlY2xhcmVkOiBu
+dW1iZXI7IGFjdGl2ZTogbnVtYmVyOyBpZGxlOiBudW1iZXI7IG9mZmxpbmU6IG51bWJlcjsgdW5rbm93bjogbnVtYmVyOyBnYXRl
+d2F5c1JlYWNoYWJsZTogbnVtYmVyOyBnYXRld2F5c0RlY2xhcmVkOiBudW1iZXIgfQogZXhwb3J0IGludGVyZmFjZSBFeHBsaWNp
+dE9mZmljZVN0YXRlIHsgc3RhdGlvbjogT2ZmaWNlU3RhdGlvblsnbmFtZSddOyBzdGF0ZTogJ1dvcmtpbmcnIHwgJ1Jldmlld2lu
+ZycgfCAnQ29sbGFib3JhdGluZyc7IGV4cGlyZXNBdDogc3RyaW5nIH0KQEAgLTUwMywxMSArNTA4LDE1IEBAIGFzeW5jIGZ1bmN0
+aW9uIHJlYWQ8VD4ocnVuOiBSdW4sIGZpbGU6IHN0cmluZywgYXJnczogc3RyaW5nW10sIHBhcnNlOiAob3V0cHV0OiBzCiBleHBv
+cnQgY29uc3QgUFJPRklMRV9OQU1FID0gL15bQS1aYS16MC05XVtBLVphLXowLTlfLi1dezAsNjN9JC8KIAogZXhwb3J0IGFzeW5j
+IGZ1bmN0aW9uIGNvbGxlY3RTbmFwc2hvdChydW46IFJ1biA9IHN5c3RlbVJ1bik6IFByb21pc2U8UnVudGltZVNuYXBzaG90PiB7
+Ci0gIGNvbnN0IFtwcm9maWxlcywgb3BlbkNvZGVdID0gYXdhaXQgUHJvbWlzZS5hbGwoWworICBjb25zdCB2ZXJzaW9uID0gKHZh
+bHVlOiBzdHJpbmcpID0+IHZhbHVlLnRyaW0oKS5zcGxpdCgnXG4nKS5wb3AoKT8udHJpbSgpIHx8ICdVbmtub3duJworICBjb25z
+dCBbcHJvZmlsZXMsIG9wZW5Db2RlLCBjbGF1ZGVDb2RlXSA9IGF3YWl0IFByb21pc2UuYWxsKFsKICAgICByZWFkKHJ1biwgJ2hl
+cm1lcycsIFsncHJvZmlsZScsICdsaXN0J10sIHBhcnNlUHJvZmlsZXMsIFtdKSwKLSAgICByZWFkKHJ1biwgJ29wZW5jb2RlJywg
+WyctLXZlcnNpb24nXSwgKHZhbHVlKSA9PiB2YWx1ZS50cmltKCkuc3BsaXQoJ1xuJykucG9wKCk/LnRyaW0oKSB8fCAnVW5rbm93
+bicsICdVbmtub3duJyksCisgICAgcmVhZChydW4sICdvcGVuY29kZScsIFsnLS12ZXJzaW9uJ10sIHZlcnNpb24sICdVbmtub3du
+JyksCisgICAgcmVhZChydW4sICdjbGF1ZGUnLCBbJy0tdmVyc2lvbiddLCB2ZXJzaW9uLCAnVW5rbm93bicpLAogICBdKQotICBy
+ZXR1cm4geyBwcm9maWxlcywgb3BlbkNvZGUsIGZldGNoZWRBdDogbmV3IERhdGUoKS50b0lTT1N0cmluZygpIH0KKyAgLy8gT24g
+V2luZG93cyBgY2xhdWRlYCBpcyBvZnRlbiBhIC5jbWQgc2hpbSB0aGF0IGNhbm5vdCBiZSBzdGFydGVkIGRpcmVjdGx5OyBhIHNl
+c3Npb24gZm9sZGVyIGlzIHByb29mIGVub3VnaC4KKyAgY29uc3QgY2xhdWRlSW5zdGFsbGVkID0gY2xhdWRlQ29kZS5hdmFpbGFi
+aWxpdHkgPT09ICdhdmFpbGFibGUnIHx8IGF3YWl0IHN0YXQocGF0aC5qb2luKGNsYXVkZURpcmVjdG9yeSgpLCAncHJvamVjdHMn
+KSkudGhlbigoaW5mbykgPT4gaW5mby5pc0RpcmVjdG9yeSgpLCAoKSA9PiBmYWxzZSkKKyAgcmV0dXJuIHsgcHJvZmlsZXMsIG9w
+ZW5Db2RlLCBjbGF1ZGVDb2RlOiBjbGF1ZGVDb2RlLmF2YWlsYWJpbGl0eSA9PT0gJ2F2YWlsYWJsZScgfHwgIWNsYXVkZUluc3Rh
+bGxlZCA/IGNsYXVkZUNvZGUgOiB7IGF2YWlsYWJpbGl0eTogJ2F2YWlsYWJsZScsIGRhdGE6ICdDbGF1ZGUgQ29kZScgfSwgZmV0
+Y2hlZEF0OiBuZXcgRGF0ZSgpLnRvSVNPU3RyaW5nKCkgfQogfQogCiAvKiogQm9hcmQgc2x1Z3MgcGFzc2VkIHRvIGBoZXJtZXMg
+a2FuYmFuIC0tYm9hcmRgOiBIZXJtZXMnIG93biBzbHVnIHJ1bGUsIG5ldmVyIGFuIG9wdGlvbi4gKi8KQEAgLTgxNSw2ICs4MjQs
+MzEgQEAgZXhwb3J0IGFzeW5jIGZ1bmN0aW9uIGNvbGxlY3RBZ2VudEFjdGl2aXR5KHByb2ZpbGVzOiByZWFkb25seSBzdHJpbmdb
+XSwgcnVuOiBSdW4KICAgcmV0dXJuIHsgYWdlbnRzLCBmZXRjaGVkQXQ6IG5ldyBEYXRlKCkudG9JU09TdHJpbmcoKSB9CiB9CiAK
+Ky8qKiBDbGF1ZGUgQ29kZSBjb25maWcgZm9sZGVyOiBSVUFOR19DTEFVREVfRElSLCB0aGVuIENMQVVERV9DT05GSUdfRElSLCB0
+aGVuIH4vLmNsYXVkZS4gKi8KK2V4cG9ydCBmdW5jdGlvbiBjbGF1ZGVEaXJlY3RvcnkoZW52OiBOb2RlSlMuUHJvY2Vzc0VudiA9
+IHByb2Nlc3MuZW52LCBob21lID0gaG9tZWRpcigpKTogc3RyaW5nIHsKKyAgcmV0dXJuIHBhdGgucmVzb2x2ZShlbnYuUlVBTkdf
+Q0xBVURFX0RJUiA/PyBlbnYuQ0xBVURFX0NPTkZJR19ESVIgPz8gcGF0aC5qb2luKGhvbWUsICcuY2xhdWRlJykpCit9CisKK2Nv
+bnN0IENMQVVERV9BQ1RJVkVfTVMgPSAyICogNjBfMDAwCisKKy8qKiBJU08gdGltZSBvZiB0aGUgbmV3ZXN0IENsYXVkZSBDb2Rl
+IHNlc3Npb24gdHJhbnNjcmlwdCB3cml0ZSB3aXRoaW4gdGhlIGxhc3QgMiBtaW51dGVzLCBpZiBhbnkuIFJlYWRzIGZpbGUgdGlt
+ZXMgb25seS4gKi8KK2V4cG9ydCBhc3luYyBmdW5jdGlvbiBjb2xsZWN0Q2xhdWRlQ29kZUFjdGl2aXR5KGRpcmVjdG9yeSA9IGNs
+YXVkZURpcmVjdG9yeSgpLCBub3cgPSBEYXRlLm5vdygpKTogUHJvbWlzZTxzdHJpbmcgfCB1bmRlZmluZWQ+IHsKKyAgY29uc3Qg
+cHJvamVjdHMgPSBwYXRoLmpvaW4oZGlyZWN0b3J5LCAncHJvamVjdHMnKQorICBsZXQgbmV3ZXN0ID0gMAorICB0cnkgeworICAg
+IGZvciAoY29uc3QgcHJvamVjdCBvZiBhd2FpdCByZWFkZGlyKHByb2plY3RzLCB7IHdpdGhGaWxlVHlwZXM6IHRydWUgfSkpIHsK
+KyAgICAgIGlmICghcHJvamVjdC5pc0RpcmVjdG9yeSgpKSBjb250aW51ZQorICAgICAgY29uc3QgZm9sZGVyID0gcGF0aC5qb2lu
+KHByb2plY3RzLCBwcm9qZWN0Lm5hbWUpCisgICAgICBmb3IgKGNvbnN0IGZpbGUgb2YgYXdhaXQgcmVhZGRpcihmb2xkZXIpKSB7
+CisgICAgICAgIGlmICghZmlsZS5lbmRzV2l0aCgnLmpzb25sJykpIGNvbnRpbnVlCisgICAgICAgIGNvbnN0IG1vZGlmaWVkID0g
+KGF3YWl0IHN0YXQocGF0aC5qb2luKGZvbGRlciwgZmlsZSkpLmNhdGNoKCgpID0+IHVuZGVmaW5lZCkpPy5tdGltZU1zID8/IDAK
+KyAgICAgICAgaWYgKG1vZGlmaWVkID4gbmV3ZXN0KSBuZXdlc3QgPSBtb2RpZmllZAorICAgICAgfQorICAgIH0KKyAgfSBjYXRj
+aCB7IHJldHVybiB1bmRlZmluZWQgfQorICByZXR1cm4gbmV3ZXN0ICYmIG5vdyAtIG5ld2VzdCA8PSBDTEFVREVfQUNUSVZFX01T
+ID8gbmV3IERhdGUobmV3ZXN0KS50b0lTT1N0cmluZygpIDogdW5kZWZpbmVkCit9CisKIC8vIC0tLS0tLS0tLS0tLS0tLS0tLS0t
+LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogLy8gT2ZmaWNlCiAKQEAgLTgy
+NSw2ICs4NTksNyBAQCBleHBvcnQgZnVuY3Rpb24gYWdlbnRSb3N0ZXIocnVudGltZTogUnVudGltZVNuYXBzaG90KTogQWdlbnRT
+cGVjW10gewogICBjb25zdCBwcm9maWxlcyA9IHJ1bnRpbWUucHJvZmlsZXMuYXZhaWxhYmlsaXR5ID09PSAnYXZhaWxhYmxlJyA/
+IHJ1bnRpbWUucHJvZmlsZXMuZGF0YSA6IFtdCiAgIGNvbnN0IGFnZW50czogQWdlbnRTcGVjW10gPSBwcm9maWxlcy5maWx0ZXIo
+KHByb2ZpbGUpID0+IFBST0ZJTEVfTkFNRS50ZXN0KHByb2ZpbGUubmFtZSkpLm1hcCgocHJvZmlsZSkgPT4gKHsgaWQ6IHByb2Zp
+bGUubmFtZSwgcm9sZTogJ0hlcm1lcyBwcm9maWxlJywgcHJvZmlsZTogcHJvZmlsZS5uYW1lLCBnYXRld2F5OiBwcm9maWxlLmdh
+dGV3YXksIGFsaWFzZXM6IFtwcm9maWxlLm5hbWUudG9Mb3dlckNhc2UoKV0gfSkpCiAgIGlmIChydW50aW1lLm9wZW5Db2RlLmF2
+YWlsYWJpbGl0eSA9PT0gJ2F2YWlsYWJsZScgJiYgIWFnZW50cy5zb21lKChhZ2VudCkgPT4gYWdlbnQuaWQgPT09ICdvcGVuY29k
+ZScpKSBhZ2VudHMucHVzaCh7IGlkOiAnb3BlbmNvZGUnLCByb2xlOiAnT3BlbkNvZGUnLCBhbGlhc2VzOiBbJ29wZW5jb2RlJywg
+J29wZW4tY29kZSddIH0pCisgIGlmIChydW50aW1lLmNsYXVkZUNvZGU/LmF2YWlsYWJpbGl0eSA9PT0gJ2F2YWlsYWJsZScgJiYg
+IWFnZW50cy5zb21lKChhZ2VudCkgPT4gYWdlbnQuaWQgPT09ICdjbGF1ZGUtY29kZScpKSBhZ2VudHMucHVzaCh7IGlkOiAnY2xh
+dWRlLWNvZGUnLCByb2xlOiAnQ2xhdWRlIENvZGUnLCBhbGlhc2VzOiBbJ2NsYXVkZS1jb2RlJywgJ2NsYXVkZSddIH0pCiAgIHJl
+dHVybiBhZ2VudHMKIH0KIApAQCAtODg5LDYgKzkyNCwxMCBAQCBleHBvcnQgZnVuY3Rpb24gYnVpbGRPZmZpY2VTdW1tYXJ5KHN0
+YXRpb25zOiBPZmZpY2VTdGF0aW9uW10sIHJ1bnRpbWU6IFJ1bnRpbWVTbgogCiBmdW5jdGlvbiBsaXZlU3RhdGUoYWdlbnQ6IEFn
+ZW50U3BlYywgc25hcHNob3Q6IEFnZW50QWN0aXZpdHlTbmFwc2hvdCB8IHVuZGVmaW5lZCk6IHsgc3RhdGU6IE9mZmljZVN0YXRl
+OyBwcm9iZT86IEFnZW50QWN0aXZpdHk7IGtub3duOiBib29sZWFuIH0gewogICBpZiAoIXNuYXBzaG90KSByZXR1cm4geyBzdGF0
+ZTogJ1Vua25vd24nLCBrbm93bjogdHJ1ZSB9CisgIGlmIChhZ2VudC5pZCA9PT0gJ2NsYXVkZS1jb2RlJykgeworICAgIC8vIENs
+YXVkZSBDb2RlIGhhcyBubyBIZXJtZXMgcHJvZmlsZTsgaXQgd29ya3Mgd2hlbiBhIHNlc3Npb24gdHJhbnNjcmlwdCB3YXMgd3Jp
+dHRlbiB0byByZWNlbnRseS4KKyAgICByZXR1cm4geyBzdGF0ZTogc25hcHNob3QuY2xhdWRlQ29kZUxhc3RTZWVuID8gJ1dvcmtp
+bmcnIDogJ1Vua25vd24nLCBwcm9iZTogc25hcHNob3QuY2xhdWRlQ29kZUxhc3RTZWVuID8geyBwcm9maWxlOiAnY2xhdWRlLWNv
+ZGUnLCBhdmFpbGFiaWxpdHk6ICdhdmFpbGFibGUnLCBhY3RpdmU6IHRydWUsIGtpbmQ6ICd0b29scycsIGxhYmVsOiAnQ29kaW5n
+IHdpdGggQ2xhdWRlIENvZGUnLCBsYXN0U2Vlbjogc25hcHNob3QuY2xhdWRlQ29kZUxhc3RTZWVuLCBtZW50aW9uc09wZW5Db2Rl
+OiBmYWxzZSB9IDogdW5kZWZpbmVkLCBrbm93bjogdHJ1ZSB9CisgIH0KICAgaWYgKCFhZ2VudC5wcm9maWxlKSB7CiAgICAgLy8g
+T3BlbkNvZGUgaGFzIG5vIEhlcm1lcyBwcm9maWxlOyBpdCBjb3VudHMgYXMgd29ya2luZyB3aGVuIGFuIGFnZW50J3MgcmVjZW50
+IGxvZyBzaG93cyBpdCBiZWluZyBkcml2ZW4uCiAgICAgY29uc3QgZHJpdmVyID0gc25hcHNob3QuYWdlbnRzLmZpbmQoKGFnZW50
+KSA9PiBhZ2VudC5tZW50aW9uc09wZW5Db2RlKQpAQCAtOTMwLDkgKzk2OSw5IEBAIGV4cG9ydCBmdW5jdGlvbiBidWlsZE9mZmlj
+ZVNuYXBzaG90KHJ1bnRpbWU6IFJ1bnRpbWVTbmFwc2hvdCwgYm9hcmQ6IFRhc2tCb2FyZFNuCiAgICAgY29uc3QgcmVjZW50QWN0
+aXZpdHkgPSBsaXZlLnByb2JlCiAgICAgICA/IGxpdmUucHJvYmUuYWN0aXZlID8gYCR7bGl2ZS5wcm9iZS5sYWJlbCA/PyAnQWN0
+aXZlJ30ke2xpdmUucHJvYmUubGFzdFNlZW4gPyBgIChsYXN0IGxvZyAke2xpdmUucHJvYmUubGFzdFNlZW59KWAgOiAnJ31gIDog
+YE5vIGFjdGl2aXR5IGluIHRoZSBsYXN0ICR7QUNUSVZJVFlfV0lORE9XfWAKICAgICAgIDogYWN0aXZpdHkuc2Vzc2lvbnMuYXZh
+aWxhYmlsaXR5ID09PSAndW5hdmFpbGFibGUnID8gJ05vdCBBdmFpbGFibGUnIDogY29sbGFib3JhdGlvbiA9PT0gJ0NvbGxhYm9y
+YXRpbmcnID8gJ0F0dHJpYnV0ZWQgYWN0aXZlIGNvbGxhYm9yYXRpb24gc2Vzc2lvbicgOiAnTm8gYXR0cmlidXRlZCByZWNlbnQg
+YWN0aXZpdHknCi0gICAgY29uc3QgcnVudGltZVByb3ZlbmFuY2UgPSBhZ2VudC5wcm9maWxlID8gYEdhdGV3YXkgJHtnYXRld2F5
+ID8/ICdVbmtub3duJ30gKGhlcm1lcyBwcm9maWxlIGxpc3QpYCA6ICdPcGVuQ29kZSB2ZXJzaW9uIGF2YWlsYWJpbGl0eSBpcyBu
+b3QgYSBzdGF0ZSBzaWduYWwnCisgICAgY29uc3QgcnVudGltZVByb3ZlbmFuY2UgPSBhZ2VudC5wcm9maWxlID8gYEdhdGV3YXkg
+JHtnYXRld2F5ID8/ICdVbmtub3duJ30gKGhlcm1lcyBwcm9maWxlIGxpc3QpYCA6IGFnZW50LmlkID09PSAnY2xhdWRlLWNvZGUn
+ID8gJ0NsYXVkZSBDb2RlIHZlcnNpb24gYXZhaWxhYmlsaXR5IGlzIG5vdCBhIHN0YXRlIHNpZ25hbCcgOiAnT3BlbkNvZGUgdmVy
+c2lvbiBhdmFpbGFiaWxpdHkgaXMgbm90IGEgc3RhdGUgc2lnbmFsJwogICAgIGNvbnN0IG1hbmFnZWRJZGxlID0gc3RhdGUgPT09
+ICdJZGxlJyA/ICc7IFJ1YW5nIG1hbmFnZWQtaWRsZSBwbGFjZW1lbnQgcG9saWN5IChub3QgYWdlbnQtcmVwb3J0ZWQgcHJlc2Vu
+Y2UpJyA6ICcnCi0gICAgY29uc3QgbGl2ZVByb3ZlbmFuY2UgPSBvcHRpb25zLmFnZW50QWN0aXZpdHkgPyBgOyBsaXZlIGFjdGl2
+aXR5ICgke2FnZW50LnByb2ZpbGUgPyBgaGVybWVzIC1wICR7YWdlbnQucHJvZmlsZX0gbG9ncy9zZXNzaW9uc2AgOiAnYWdlbnQg
+bG9ncyBtZW50aW9uaW5nIE9wZW5Db2RlJ30sIGxhc3QgJHtBQ1RJVklUWV9XSU5ET1d9KTogJHshYWdlbnRBY3Rpdml0eSB8fCAh
+bGl2ZS5rbm93biA/ICd1bmF2YWlsYWJsZScgOiBsaXZlLnN0YXRlICE9PSAnVW5rbm93bicgPyBsaXZlLnByb2JlPy5raW5kID8/
+ICdhY3RpdmUnIDogJ25vbmUnfWAgOiAnJworICAgIGNvbnN0IGxpdmVQcm92ZW5hbmNlID0gb3B0aW9ucy5hZ2VudEFjdGl2aXR5
+ID8gYDsgbGl2ZSBhY3Rpdml0eSAoJHthZ2VudC5wcm9maWxlID8gYGhlcm1lcyAtcCAke2FnZW50LnByb2ZpbGV9IGxvZ3Mvc2Vz
+c2lvbnNgIDogYWdlbnQuaWQgPT09ICdjbGF1ZGUtY29kZScgPyAnfi8uY2xhdWRlL3Byb2plY3RzIHRyYW5zY3JpcHRzJyA6ICdh
+Z2VudCBsb2dzIG1lbnRpb25pbmcgT3BlbkNvZGUnfSwgbGFzdCAke0FDVElWSVRZX1dJTkRPV30pOiAkeyFhZ2VudEFjdGl2aXR5
+IHx8ICFsaXZlLmtub3duID8gJ3VuYXZhaWxhYmxlJyA6IGxpdmUuc3RhdGUgIT09ICdVbmtub3duJyA/IGxpdmUucHJvYmU/Lmtp
+bmQgPz8gJ2FjdGl2ZScgOiAnbm9uZSd9YCA6ICcnCiAgICAgcmV0dXJuIHsKICAgICAgIGlkOiBhZ2VudC5pZCwKICAgICAgIG5h
+bWU6IGFnZW50LmlkLApAQCAtMTAwOCw3ICsxMDQ3LDExIEBAIGV4cG9ydCBmdW5jdGlvbiBnZXRVc2FnZShkYXlzOiBudW1iZXIs
+IG5vdyA9IERhdGUubm93KCkpOiBQcm9taXNlPFVzYWdlU25hcHNob3Q+CiBjb25zdCBsb2dzU291cmNlID0gY2FjaGVkU291cmNl
+KCgpID0+IGNvbGxlY3RMb2dzKCksIDVfMDAwKQogY29uc3QgYWdlbnRBY3Rpdml0eVNvdXJjZSA9IGNhY2hlZFNvdXJjZShhc3lu
+YyAoKSA9PiB7CiAgIGNvbnN0IHJ1bnRpbWUgPSBhd2FpdCBnZXRTbmFwc2hvdCgpCi0gIHJldHVybiBjb2xsZWN0QWdlbnRBY3Rp
+dml0eShydW50aW1lLnByb2ZpbGVzLmF2YWlsYWJpbGl0eSA9PT0gJ2F2YWlsYWJsZScgPyBydW50aW1lLnByb2ZpbGVzLmRhdGEu
+bWFwKChwcm9maWxlKSA9PiBwcm9maWxlLm5hbWUpIDogW10pCisgIGNvbnN0IFtzbmFwc2hvdCwgY2xhdWRlQ29kZUxhc3RTZWVu
+XSA9IGF3YWl0IFByb21pc2UuYWxsKFsKKyAgICBjb2xsZWN0QWdlbnRBY3Rpdml0eShydW50aW1lLnByb2ZpbGVzLmF2YWlsYWJp
+bGl0eSA9PT0gJ2F2YWlsYWJsZScgPyBydW50aW1lLnByb2ZpbGVzLmRhdGEubWFwKChwcm9maWxlKSA9PiBwcm9maWxlLm5hbWUp
+IDogW10pLAorICAgIHJ1bnRpbWUuY2xhdWRlQ29kZT8uYXZhaWxhYmlsaXR5ID09PSAnYXZhaWxhYmxlJyA/IGNvbGxlY3RDbGF1
+ZGVDb2RlQWN0aXZpdHkoKSA6IHVuZGVmaW5lZCwKKyAgXSkKKyAgcmV0dXJuIGNsYXVkZUNvZGVMYXN0U2VlbiA/IHsgLi4uc25h
+cHNob3QsIGNsYXVkZUNvZGVMYXN0U2VlbiB9IDogc25hcHNob3QKIH0sIDE1XzAwMCkKIAogZXhwb3J0IGZ1bmN0aW9uIGdldFNu
+YXBzaG90KG5vdyA9IERhdGUubm93KCkpOiBQcm9taXNlPFJ1bnRpbWVTbmFwc2hvdD4geyByZXR1cm4gcnVudGltZVNvdXJjZShu
+b3cpIH0KZGlmZiAtLWdpdCBhL3NyYy9wYWdlcy9BZ2VudHMudHN4IGIvc3JjL3BhZ2VzL0FnZW50cy50c3gKaW5kZXggMGIzYTNl
+Ni4uMDBjNTRlOCAxMDA2NDQKLS0tIGEvc3JjL3BhZ2VzL0FnZW50cy50c3gKKysrIGIvc3JjL3BhZ2VzL0FnZW50cy50c3gKQEAg
+LTExLDExICsxMSwxMyBAQCBleHBvcnQgZnVuY3Rpb24gQWdlbnRzKHsgcnVudGltZSwgcGVuZGluZyA9IGZhbHNlIH06IHsgcnVu
+dGltZTogUnVudGltZVNuYXBzaG90CiAgIGlmICghcnVudGltZSB8fCBydW50aW1lLnByb2ZpbGVzLmF2YWlsYWJpbGl0eSA9PT0g
+J3VuYXZhaWxhYmxlJykgcmV0dXJuIDw+PFBhZ2VUaXRsZSBleWVicm93PSJDUkVXIiB0aXRsZT0iQWdlbnRzIi8+PEVtcHR5U3Rh
+dGUgdGl0bGU9Ik5vdCBBdmFpbGFibGUiPlRoZSBIZXJtZXMgcHJvZmlsZSBsaXN0IGNvdWxkIG5vdCBiZSByZWFkLiBJcyA8Y29k
+ZT5oZXJtZXM8L2NvZGU+IG9uIHRoZSBQQVRIIG9mIHRoZSBzZXJ2ZXI/PC9FbXB0eVN0YXRlPjwvPgogICBjb25zdCBzdGF0ZXMg
+PSBuZXcgTWFwKG9mZmljZS5zdGF0dXMgPT09ICdyZWFkeScgPyBvZmZpY2UuZGF0YS5zdGF0aW9ucy5tYXAoKHN0YXRpb24pID0+
+IFtzdGF0aW9uLmlkLCBzdGF0aW9uXSkgOiBbXSkKICAgY29uc3Qgb3BlbkNvZGUgPSBydW50aW1lLm9wZW5Db2RlLmF2YWlsYWJp
+bGl0eSA9PT0gJ2F2YWlsYWJsZScgPyBydW50aW1lLm9wZW5Db2RlLmRhdGEgOiB1bmRlZmluZWQKKyAgY29uc3QgY2xhdWRlQ29k
+ZSA9IHJ1bnRpbWUuY2xhdWRlQ29kZT8uYXZhaWxhYmlsaXR5ID09PSAnYXZhaWxhYmxlJyA/IHJ1bnRpbWUuY2xhdWRlQ29kZS5k
+YXRhIDogdW5kZWZpbmVkCiAgIGNvbnN0IGNhcmRzID0gWwogICAgIC4uLnJ1bnRpbWUucHJvZmlsZXMuZGF0YS5tYXAoKHByb2Zp
+bGUpID0+ICh7IGlkOiBwcm9maWxlLm5hbWUsIGtpbmQ6ICdIZXJtZXMgcHJvZmlsZScsIG1vZGVsOiBwcm9maWxlLm1vZGVsLCBn
+YXRld2F5OiBwcm9maWxlLmdhdGV3YXkgfSkpLAogICAgIC4uLihvcGVuQ29kZSA/IFt7IGlkOiAnb3BlbmNvZGUnLCBraW5kOiAn
+T3BlbkNvZGUgKENMSSB0b29sKScsIG1vZGVsOiBvcGVuQ29kZSwgZ2F0ZXdheTogdW5kZWZpbmVkIH1dIDogW10pLAorICAgIC4u
+LihjbGF1ZGVDb2RlID8gW3sgaWQ6ICdjbGF1ZGUtY29kZScsIGtpbmQ6ICdDbGF1ZGUgQ29kZSAoQ0xJIHRvb2wpJywgbW9kZWw6
+IGNsYXVkZUNvZGUsIGdhdGV3YXk6IHVuZGVmaW5lZCB9XSA6IFtdKSwKICAgXQotICByZXR1cm4gPD48UGFnZVRpdGxlIGV5ZWJy
+b3c9IkNSRVciIHRpdGxlPSJBZ2VudHMiPkV2ZXJ5IEhlcm1lcyBwcm9maWxlIG9uIHRoaXMgbWFjaGluZSAoZnJvbSA8Y29kZT5o
+ZXJtZXMgcHJvZmlsZSBsaXN0PC9jb2RlPikgaXMgYW4gYWdlbnR7b3BlbkNvZGUgPyAnLCBwbHVzIE9wZW5Db2RlJyA6ICcnfS4g
+Tm90aGluZyBpcyBjb25maWd1cmVkIGJ5IGhhbmQ6IG5ldyBwcm9maWxlcyBhcHBlYXIgaGVyZSBhbmQgaW4gdGhlIG9mZmljZSBh
+dXRvbWF0aWNhbGx5LjwvUGFnZVRpdGxlPgorICByZXR1cm4gPD48UGFnZVRpdGxlIGV5ZWJyb3c9IkNSRVciIHRpdGxlPSJBZ2Vu
+dHMiPkV2ZXJ5IEhlcm1lcyBwcm9maWxlIG9uIHRoaXMgbWFjaGluZSAoZnJvbSA8Y29kZT5oZXJtZXMgcHJvZmlsZSBsaXN0PC9j
+b2RlPikgaXMgYW4gYWdlbnR7b3BlbkNvZGUgPyAnLCBwbHVzIE9wZW5Db2RlJyA6ICcnfXtjbGF1ZGVDb2RlID8gYCR7b3BlbkNv
+ZGUgPyAnIGFuZCcgOiAnLCBwbHVzJ30gQ2xhdWRlIENvZGVgIDogJyd9LiBOb3RoaW5nIGlzIGNvbmZpZ3VyZWQgYnkgaGFuZDog
+bmV3IHByb2ZpbGVzIGFwcGVhciBoZXJlIGFuZCBpbiB0aGUgb2ZmaWNlIGF1dG9tYXRpY2FsbHkuPC9QYWdlVGl0bGU+CiAgICAg
+PHNlY3Rpb24gY2xhc3NOYW1lPSJhZ2VudC1ncmlkIj57Y2FyZHMubWFwKChjYXJkKSA9PiB7CiAgICAgICBjb25zdCBzdGF0aW9u
+ID0gc3RhdGVzLmdldChjYXJkLmlkKQogICAgICAgcmV0dXJuIDxhcnRpY2xlIGNsYXNzTmFtZT0iYWdlbnQtY2FyZCIga2V5PXtj
+YXJkLmlkfT4KZGlmZiAtLWdpdCBhL3NyYy9wYWdlcy9NZW1vcnkudHN4IGIvc3JjL3BhZ2VzL01lbW9yeS50c3gKaW5kZXggM2E1
+ODE4Zi4uZTkzOGFmYSAxMDA2NDQKLS0tIGEvc3JjL3BhZ2VzL01lbW9yeS50c3gKKysrIGIvc3JjL3BhZ2VzL01lbW9yeS50c3gK
+QEAgLTk3LDcgKzk3LDcgQEAgZXhwb3J0IGZ1bmN0aW9uIE1lbW9yeSh7IG9uT3BlbkZvbGRlcnMgfTogeyBvbk9wZW5Gb2xkZXJz
+PzogKCkgPT4gdm9pZCB9KSB7CiAgICAgICAgIGNvbnN0IHBlYWsgPSBNYXRoLm1heChpdGVtLm1lbW9yeT8ucGVyY2VudCA/PyAw
+LCBpdGVtLnVzZXI/LnBlcmNlbnQgPz8gMCkKICAgICAgICAgcmV0dXJuIDxidXR0b24ga2V5PXtpdGVtLnByb2ZpbGV9IHJvbGU9
+InRhYiIgYXJpYS1zZWxlY3RlZD17aXRlbS5wcm9maWxlID09PSBhZ2VudC5wcm9maWxlfSBjbGFzc05hbWU9e2BtZW1vcnktdGFi
+JHtpdGVtLnByb2ZpbGUgPT09IGFnZW50LnByb2ZpbGUgPyAnIGFjdGl2ZScgOiAnJ31gfSBvbkNsaWNrPXsoKSA9PiBzZXRTZWxl
+Y3RlZChpdGVtLnByb2ZpbGUpfSBkaXNhYmxlZD17IWl0ZW0uYXZhaWxhYmxlICYmICFpdGVtLmxvY2tlZH0+CiAgICAgICAgICAg
+PHNwYW4gY2xhc3NOYW1lPSJmb2xkZXItZ2x5cGggc21hbGwiIGFyaWEtaGlkZGVuPSJ0cnVlIj48UGl4ZWxDaGFyYWN0ZXIgYWdl
+bnQ9e2l0ZW0ucHJvZmlsZX0vPjwvc3Bhbj4KLSAgICAgICAgICA8c3Bhbj48c3Ryb25nPntpdGVtLmxvY2tlZCA/ICfwn5SSICcg
+OiAnJ317aXRlbS5sYWJlbH08L3N0cm9uZz48c21hbGw+eyFpdGVtLmF2YWlsYWJsZSA/IGl0ZW0ucmVhc29uID8/ICdub3QgYXZh
+aWxhYmxlJyA6IGl0ZW0ua2luZCA9PT0gJ29wZW5jb2RlJyA/IGAke2l0ZW0uY29udGV4dEZpbGVzLmxlbmd0aH0gcnVsZXMgZmls
+ZShzKWAgOiBgJHsoaXRlbS5tZW1vcnk/LmVudHJpZXMubGVuZ3RoID8/IDApICsgKGl0ZW0udXNlcj8uZW50cmllcy5sZW5ndGgg
+Pz8gMCl9IGVudHJpZXMgwrcgJHtwZWFrfSUgcGVha2B9PC9zbWFsbD48L3NwYW4+CisgICAgICAgICAgPHNwYW4+PHN0cm9uZz57
+aXRlbS5sb2NrZWQgPyAn8J+UkiAnIDogJyd9e2l0ZW0ubGFiZWx9PC9zdHJvbmc+PHNtYWxsPnshaXRlbS5hdmFpbGFibGUgPyBp
+dGVtLnJlYXNvbiA/PyAnbm90IGF2YWlsYWJsZScgOiBpdGVtLmtpbmQgIT09ICdoZXJtZXMnID8gYCR7aXRlbS5jb250ZXh0Rmls
+ZXMubGVuZ3RofSBydWxlcyBmaWxlKHMpYCA6IGAkeyhpdGVtLm1lbW9yeT8uZW50cmllcy5sZW5ndGggPz8gMCkgKyAoaXRlbS51
+c2VyPy5lbnRyaWVzLmxlbmd0aCA/PyAwKX0gZW50cmllcyDCtyAke3BlYWt9JSBwZWFrYH08L3NtYWxsPjwvc3Bhbj4KICAgICAg
+ICAgPC9idXR0b24+CiAgICAgICB9KX08L2Rpdj4KICAgICAgIDxQcml2YXRlR2F0ZSBhZ2VudD17YWdlbnQucHJvZmlsZX0+e2Fn
+ZW50LmxvY2tlZCA/IDxQcm9maWxlVW5sb2NrIGFnZW50PXthZ2VudC5wcm9maWxlfS8+IDogPEFnZW50UGFuZWwga2V5PXthZ2Vu
+dC5wcm9maWxlfSBhZ2VudD17YWdlbnR9IG9uT3BlbkZvbGRlcnM9e29uT3BlbkZvbGRlcnN9Lz59PC9Qcml2YXRlR2F0ZT4KZGlm
+ZiAtLWdpdCBhL3NyYy9wYWdlcy9Qcm9maWxlTG9ja1NldHRpbmdzLnRzeCBiL3NyYy9wYWdlcy9Qcm9maWxlTG9ja1NldHRpbmdz
+LnRzeAppbmRleCA5ZjRhMzg4Li5hZmJmY2M3IDEwMDY0NAotLS0gYS9zcmMvcGFnZXMvUHJvZmlsZUxvY2tTZXR0aW5ncy50c3gK
+KysrIGIvc3JjL3BhZ2VzL1Byb2ZpbGVMb2NrU2V0dGluZ3MudHN4CkBAIC0xNSw2ICsxNSw3IEBAIGV4cG9ydCBmdW5jdGlvbiBQ
+cm9maWxlTG9ja1NldHRpbmdzKCkgewogICBjb25zdCBhZ2VudHMgPSBydW50aW1lLnN0YXR1cyA9PT0gJ3JlYWR5JyA/IFsKICAg
+ICAuLi4ocnVudGltZS5kYXRhLnByb2ZpbGVzLmF2YWlsYWJpbGl0eSA9PT0gJ2F2YWlsYWJsZScgPyBydW50aW1lLmRhdGEucHJv
+ZmlsZXMuZGF0YS5tYXAoKHByb2ZpbGUpID0+IHByb2ZpbGUubmFtZSkgOiBbXSksCiAgICAgLi4uKHJ1bnRpbWUuZGF0YS5vcGVu
+Q29kZS5hdmFpbGFiaWxpdHkgPT09ICdhdmFpbGFibGUnID8gWydvcGVuY29kZSddIDogW10pLAorICAgIC4uLihydW50aW1lLmRh
+dGEuY2xhdWRlQ29kZT8uYXZhaWxhYmlsaXR5ID09PSAnYXZhaWxhYmxlJyA/IFsnY2xhdWRlLWNvZGUnXSA6IFtdKSwKICAgXSA6
+IFtdCiAgIGNvbnN0IGZpbmlzaCA9ICh0ZXh0OiBzdHJpbmcpID0+ICgpID0+IHsgc2V0TW9kZSgnaWRsZScpOyBzZXRNZXNzYWdl
+KHRleHQpIH0KICAgY29uc3Qgc3RhcnQgPSAobmV4dDogTW9kZSkgPT4gKCkgPT4geyBzZXRNZXNzYWdlKHVuZGVmaW5lZCk7IHNl
+dE1vZGUobmV4dCkgfQpkaWZmIC0tZ2l0IGEvc3JjL3R5cGVzLnRzIGIvc3JjL3R5cGVzLnRzCmluZGV4IDBmYjJmNDguLmNjMzE0
+YmYgMTAwNjQ0Ci0tLSBhL3NyYy90eXBlcy50cworKysgYi9zcmMvdHlwZXMudHMKQEAgLTUsNiArNSw3IEBAIGV4cG9ydCBpbnRl
+cmZhY2UgUnVudGltZVNuYXBzaG90IHsKICAgLyoqIEV2ZXJ5IEhlcm1lcyBwcm9maWxlIGlzIGFuIGFnZW50OyBgZ2F0ZXdheWAg
+Y29tZXMgZnJvbSBgaGVybWVzIHByb2ZpbGUgbGlzdGAuICovCiAgIHByb2ZpbGVzOiBTb3VyY2U8eyBuYW1lOiBzdHJpbmc7IG1v
+ZGVsOiBzdHJpbmc7IGdhdGV3YXk6IEdhdGV3YXlTdGF0ZSB9W10+CiAgIG9wZW5Db2RlOiBTb3VyY2U8c3RyaW5nPgorICBjbGF1
+ZGVDb2RlPzogU291cmNlPHN0cmluZz4KICAgZmV0Y2hlZEF0OiBzdHJpbmcKIH0KIGV4cG9ydCBpbnRlcmZhY2UgVGFzayB7IHRp
+dGxlOiBzdHJpbmc7IHN0YXR1czogc3RyaW5nOyBpZD86IHN0cmluZzsgYXNzaWduZWU/OiBzdHJpbmc7IHByaW9yaXR5PzogbnVt
+YmVyOyBib2FyZD86IHN0cmluZzsgcHJpdmF0ZT86IGJvb2xlYW4gfQpAQCAtMTE4LDUgKzExOSw1IEBAIGV4cG9ydCBpbnRlcmZh
+Y2UgVGFza0RldGFpbFNuYXBzaG90IHsgdGFzazogU291cmNlPFRhc2tEZXRhaWwgfCBudWxsPjsgZmV0Y2hlZEF0CiBleHBvcnQg
+aW50ZXJmYWNlIE1lbW9yeURvY3VtZW50IHsgbmFtZTogc3RyaW5nOyBwYXRoOiBzdHJpbmc7IGV4aXN0czogYm9vbGVhbjsgc2l6
+ZT86IG51bWJlcjsgbW9kaWZpZWQ/OiBzdHJpbmc7IGNoYXJzPzogbnVtYmVyOyBjb250ZW50Pzogc3RyaW5nOyB0cnVuY2F0ZWQ/
+OiBib29sZWFuOyByZWRhY3Rpb25zPzogbnVtYmVyOyBlcnJvcj86IHN0cmluZyB9CiBleHBvcnQgaW50ZXJmYWNlIE1lbW9yeVN0
+b3JlIGV4dGVuZHMgTWVtb3J5RG9jdW1lbnQgeyBlbnRyaWVzOiBzdHJpbmdbXTsgbGltaXQ6IG51bWJlcjsgdXNlZDogbnVtYmVy
+OyBwZXJjZW50OiBudW1iZXIgfQogZXhwb3J0IGludGVyZmFjZSBNZW1vcnlTZXR0aW5ncyB7IG1lbW9yeUVuYWJsZWQ6IGJvb2xl
+YW47IHVzZXJQcm9maWxlRW5hYmxlZDogYm9vbGVhbjsgd3JpdGVBcHByb3ZhbDogYm9vbGVhbjsgcHJvdmlkZXI/OiBzdHJpbmc7
+IG1lbW9yeUxpbWl0OiBudW1iZXI7IHVzZXJMaW1pdDogbnVtYmVyOyBzb3VyY2U6ICdjb25maWcueWFtbCcgfCAnZGVmYXVsdHMn
+IH0KLWV4cG9ydCBpbnRlcmZhY2UgQWdlbnRNZW1vcnkgeyBwcm9maWxlOiBzdHJpbmc7IGxhYmVsOiBzdHJpbmc7IHBhdGg6IHN0
+cmluZzsga2luZDogJ2hlcm1lcycgfCAnb3BlbmNvZGUnOyBhdmFpbGFibGU6IGJvb2xlYW47IHJlYXNvbj86IHN0cmluZzsgc291
+bD86IE1lbW9yeURvY3VtZW50OyBtZW1vcnk/OiBNZW1vcnlTdG9yZTsgdXNlcj86IE1lbW9yeVN0b3JlOyBjb250ZXh0RmlsZXM6
+IE1lbW9yeURvY3VtZW50W107IHNldHRpbmdzPzogTWVtb3J5U2V0dGluZ3M7IGxvY2tlZD86IGJvb2xlYW4gfQorZXhwb3J0IGlu
+dGVyZmFjZSBBZ2VudE1lbW9yeSB7IHByb2ZpbGU6IHN0cmluZzsgbGFiZWw6IHN0cmluZzsgcGF0aDogc3RyaW5nOyBraW5kOiAn
+aGVybWVzJyB8ICdvcGVuY29kZScgfCAnY2xhdWRlLWNvZGUnOyBhdmFpbGFibGU6IGJvb2xlYW47IHJlYXNvbj86IHN0cmluZzsg
+c291bD86IE1lbW9yeURvY3VtZW50OyBtZW1vcnk/OiBNZW1vcnlTdG9yZTsgdXNlcj86IE1lbW9yeVN0b3JlOyBjb250ZXh0Rmls
+ZXM6IE1lbW9yeURvY3VtZW50W107IHNldHRpbmdzPzogTWVtb3J5U2V0dGluZ3M7IGxvY2tlZD86IGJvb2xlYW4gfQogZXhwb3J0
+IGludGVyZmFjZSBNZW1vcnlTbmFwc2hvdCB7IGFnZW50czogQWdlbnRNZW1vcnlbXTsgZmV0Y2hlZEF0OiBzdHJpbmcgfQo=
 '@
-# Tulis dengan akhir baris LF tanpa BOM supaya git apply cocok.
-[IO.File]::WriteAllText($patchFile, ($patch -replace "`r`n", "`n") + "`n", (New-Object Text.UTF8Encoding($false)))
+[IO.File]::WriteAllBytes($patchFile, [Convert]::FromBase64String(($patchB64 -replace '\s', '')))
 
 Set-Location $Dir
 git apply --ignore-whitespace $patchFile
