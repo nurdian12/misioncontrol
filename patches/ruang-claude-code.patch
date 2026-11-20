@@ -1,0 +1,299 @@
+diff --git a/server/activity-folders.test.ts b/server/activity-folders.test.ts
+index 4ee1c5b..2afe476 100644
+--- a/server/activity-folders.test.ts
++++ b/server/activity-folders.test.ts
+@@ -223,3 +223,22 @@ describe('the Hermes profiles folder', () => {
+     }
+   })
+ })
++
++describe('Claude Code agent', () => {
++  it('reports activity only for a transcript written in the last 2 minutes', async () => {
++    const { mkdtemp, mkdir, writeFile, utimes } = await import('node:fs/promises')
++    const { tmpdir } = await import('node:os')
++    const { join } = await import('node:path')
++    const { collectClaudeCodeActivity } = await import('./mission-control.js')
++    const dir = await mkdtemp(join(tmpdir(), 'claude-'))
++    await mkdir(join(dir, 'projects', 'p'), { recursive: true })
++    const file = join(dir, 'projects', 'p', 's.jsonl')
++    await writeFile(file, '{}')
++    const now = Date.now()
++    await utimes(file, new Date(now - 30_000), new Date(now - 30_000))
++    expect(await collectClaudeCodeActivity(dir, now)).toBeDefined()
++    await utimes(file, new Date(now - 600_000), new Date(now - 600_000))
++    expect(await collectClaudeCodeActivity(dir, now)).toBeUndefined()
++    expect(await collectClaudeCodeActivity(join(dir, 'missing'), now)).toBeUndefined()
++  })
++})
+diff --git a/server/folders.ts b/server/folders.ts
+index 8d3114a..cb5c741 100644
+--- a/server/folders.ts
++++ b/server/folders.ts
+@@ -2,7 +2,7 @@ import { constants } from 'node:fs'
+ import { access, open, readdir, realpath, stat } from 'node:fs/promises'
+ import { homedir, userInfo } from 'node:os'
+ import path from 'node:path'
+-import { redactLogLine } from './mission-control.js'
++import { claudeDirectory, redactLogLine } from './mission-control.js'
+ 
+ // Read-only browser over each agent's own folder: ~/.hermes/profiles/<name> for Hermes
+ // profiles (`default` falls back to ~/.hermes when it has no profiles/default folder) and
+@@ -233,11 +233,12 @@ export async function resolveAgentFolders(profiles: string[], env: NodeJS.Proces
+   const root = hermesRoot(env, home)
+   // Every Hermes profile this machine reports; `default` always exists in Hermes, so it is the
+   // fallback when the profile list cannot be read.
+-  const listed = profiles.filter((name) => name !== 'opencode' && PROFILE_NAME.test(name))
++  const listed = profiles.filter((name) => name !== 'opencode' && name !== 'claude-code' && PROFILE_NAME.test(name))
+   const names = [...new Set(listed.length ? listed : ['default'])]
+   const specs = [
+     ...names.map((profile) => ({ profile, candidates: profile === 'default' ? [path.join(root, 'profiles', 'default'), root] : [path.join(root, 'profiles', profile)] })),
+     { profile: 'opencode', candidates: (env.RUANG_OPENCODE_DIR ?? env.MISSION_CONTROL_OPENCODE_DIR) ? [path.resolve((env.RUANG_OPENCODE_DIR ?? env.MISSION_CONTROL_OPENCODE_DIR)!)] : [path.join(home, '.opencode'), path.join(home, '.config', 'opencode')] },
++    { profile: 'claude-code', candidates: [claudeDirectory(env, home)] },
+   ]
+   const realRoot = await realpath(root).catch(() => root)
+   const claimed = new Map<string, string>()
+@@ -247,7 +248,7 @@ export async function resolveAgentFolders(profiles: string[], env: NodeJS.Proces
+     const label = spec.profile
+     const base = { profile: spec.profile, label, path: displayPath(directory, home), directory: real ?? directory }
+     // OpenCode is optional: without its folder it is simply not listed.
+-    if (!real && spec.profile === 'opencode' && !denied) continue
++    if (!real && (spec.profile === 'opencode' || spec.profile === 'claude-code') && !denied) continue
+     if (!real) { folders.push({ ...base, available: false, reason: denied ? `Permission denied for "${processUser()}" (a parent folder is not readable)` : 'Folder not found on this machine' }); continue }
+     if (spec.profile !== 'default' && real === realRoot) { folders.push({ ...base, available: false, reason: 'Resolves to the shared Hermes root, not its own folder' }); continue }
+     const owner = claimed.get(real)
+diff --git a/server/memory.ts b/server/memory.ts
+index 86a2cdf..e1b2672 100644
+--- a/server/memory.ts
++++ b/server/memory.ts
+@@ -15,6 +15,7 @@ export const DEFAULT_MEMORY_LIMIT = 2200
+ export const DEFAULT_USER_LIMIT = 1375
+ const CONTEXT_FILES = ['HERMES.md', '.hermes.md', 'AGENTS.override.md', 'AGENTS.md', 'CLAUDE.md', '.cursorrules']
+ const OPENCODE_CONTEXT_FILES = ['AGENTS.md', 'CLAUDE.md']
++const CLAUDE_CODE_CONTEXT_FILES = ['CLAUDE.md']
+ 
+ export interface MemoryDocument {
+   name: string
+@@ -47,7 +48,7 @@ export interface AgentMemory {
+   profile: string
+   label: string
+   path: string
+-  kind: 'hermes' | 'opencode'
++  kind: 'hermes' | 'opencode' | 'claude-code'
+   available: boolean
+   reason?: string
+   soul?: MemoryDocument
+@@ -117,9 +118,15 @@ export function parseMemorySettings(configYaml: string | undefined): MemorySetti
+   }
+ }
+ 
++const kindOf = (profile: string): AgentMemory['kind'] => profile === 'opencode' ? 'opencode' : profile === 'claude-code' ? 'claude-code' : 'hermes'
++
+ export async function collectAgentMemory(folder: AgentFolder): Promise<AgentMemory> {
+   const base = { profile: folder.profile, label: folder.label, path: folder.path }
+-  if (!folder.available) return { ...base, kind: folder.profile === 'opencode' ? 'opencode' : 'hermes', available: false, reason: folder.reason, contextFiles: [] }
++  if (!folder.available) return { ...base, kind: kindOf(folder.profile), available: false, reason: folder.reason, contextFiles: [] }
++  if (folder.profile === 'claude-code') {
++    const contextFiles = (await Promise.all(CLAUDE_CODE_CONTEXT_FILES.map((name) => readDocument(folder, name)))).filter((document) => document.exists)
++    return { ...base, kind: 'claude-code', available: true, contextFiles }
++  }
+   if (folder.profile === 'opencode') {
+     const contextFiles = (await Promise.all(OPENCODE_CONTEXT_FILES.map((name) => readDocument(folder, name)))).filter((document) => document.exists)
+     return { ...base, kind: 'opencode', available: true, contextFiles }
+@@ -147,7 +154,7 @@ export async function collectAgentMemory(folder: AgentFolder): Promise<AgentMemo
+ export async function collectMemory(folders: AgentFolder[]): Promise<MemorySnapshot> {
+   // One unreadable agent must not take the whole page down.
+   const agents = await Promise.all(folders.map((folder) => collectAgentMemory(folder).catch((error: unknown): AgentMemory => ({
+-    profile: folder.profile, label: folder.label, path: folder.path, kind: folder.profile === 'opencode' ? 'opencode' : 'hermes',
++    profile: folder.profile, label: folder.label, path: folder.path, kind: kindOf(folder.profile),
+     available: false, reason: error instanceof Error ? error.message : 'Could not read this agent.', contextFiles: [],
+   }))))
+   return { agents, fetchedAt: new Date().toISOString() }
+diff --git a/server/mission-control.ts b/server/mission-control.ts
+index ba86533..53ebcd5 100644
+--- a/server/mission-control.ts
++++ b/server/mission-control.ts
+@@ -1,5 +1,8 @@
+ import { execFile as execFileCallback } from 'node:child_process'
+ import { promisify } from 'node:util'
++import { readdir, stat } from 'node:fs/promises'
++import { homedir } from 'node:os'
++import path from 'node:path'
+ 
+ const execFile = promisify(execFileCallback)
+ const CACHE_MS = 10_000
+@@ -21,6 +24,8 @@ export interface Source<T> {
+ export interface RuntimeSnapshot {
+   profiles: Source<Profile[]>
+   openCode: Source<string>
++  /** Claude Code CLI version; optional so older snapshots stay valid. */
++  claudeCode?: Source<string>
+   fetchedAt: string
+ }
+ export interface Task { title: string; status: string; id?: string; assignee?: string; priority?: number; board?: string; /** Belongs to a locked agent (profile lock): the title is withheld. */ private?: boolean }
+@@ -59,7 +64,7 @@ export interface OfficeStation {
+ }
+ export type ActivityKind = 'chat' | 'cron' | 'tools' | 'thinking'
+ export interface AgentActivity { profile: string; availability: Availability; active: boolean; kind?: ActivityKind; label?: string; lastSeen?: string; mentionsOpenCode: boolean }
+-export interface AgentActivitySnapshot { agents: AgentActivity[]; fetchedAt: string }
++export interface AgentActivitySnapshot { agents: AgentActivity[]; /** Claude Code: last write to a session transcript, when it is recent. */ claudeCodeLastSeen?: string; fetchedAt: string }
+ export interface OfficeSnapshot { stations: OfficeStation[]; summary: OfficeSummary; fetchedAt: string }
+ export interface OfficeSummary { declared: number; active: number; idle: number; offline: number; unknown: number; gatewaysReachable: number; gatewaysDeclared: number }
+ export interface ExplicitOfficeState { station: OfficeStation['name']; state: 'Working' | 'Reviewing' | 'Collaborating'; expiresAt: string }
+@@ -503,11 +508,15 @@ async function read<T>(run: Run, file: string, args: string[], parse: (output: s
+ export const PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
+ 
+ export async function collectSnapshot(run: Run = systemRun): Promise<RuntimeSnapshot> {
+-  const [profiles, openCode] = await Promise.all([
++  const version = (value: string) => value.trim().split('\n').pop()?.trim() || 'Unknown'
++  const [profiles, openCode, claudeCode] = await Promise.all([
+     read(run, 'hermes', ['profile', 'list'], parseProfiles, []),
+-    read(run, 'opencode', ['--version'], (value) => value.trim().split('\n').pop()?.trim() || 'Unknown', 'Unknown'),
++    read(run, 'opencode', ['--version'], version, 'Unknown'),
++    read(run, 'claude', ['--version'], version, 'Unknown'),
+   ])
+-  return { profiles, openCode, fetchedAt: new Date().toISOString() }
++  // On Windows `claude` is often a .cmd shim that cannot be started directly; a session folder is proof enough.
++  const claudeInstalled = claudeCode.availability === 'available' || await stat(path.join(claudeDirectory(), 'projects')).then((info) => info.isDirectory(), () => false)
++  return { profiles, openCode, claudeCode: claudeCode.availability === 'available' || !claudeInstalled ? claudeCode : { availability: 'available', data: 'Claude Code' }, fetchedAt: new Date().toISOString() }
+ }
+ 
+ /** Board slugs passed to `hermes kanban --board`: Hermes' own slug rule, never an option. */
+@@ -815,6 +824,31 @@ export async function collectAgentActivity(profiles: readonly string[], run: Run
+   return { agents, fetchedAt: new Date().toISOString() }
+ }
+ 
++/** Claude Code config folder: RUANG_CLAUDE_DIR, then CLAUDE_CONFIG_DIR, then ~/.claude. */
++export function claudeDirectory(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
++  return path.resolve(env.RUANG_CLAUDE_DIR ?? env.CLAUDE_CONFIG_DIR ?? path.join(home, '.claude'))
++}
++
++const CLAUDE_ACTIVE_MS = 2 * 60_000
++
++/** ISO time of the newest Claude Code session transcript write within the last 2 minutes, if any. Reads file times only. */
++export async function collectClaudeCodeActivity(directory = claudeDirectory(), now = Date.now()): Promise<string | undefined> {
++  const projects = path.join(directory, 'projects')
++  let newest = 0
++  try {
++    for (const project of await readdir(projects, { withFileTypes: true })) {
++      if (!project.isDirectory()) continue
++      const folder = path.join(projects, project.name)
++      for (const file of await readdir(folder)) {
++        if (!file.endsWith('.jsonl')) continue
++        const modified = (await stat(path.join(folder, file)).catch(() => undefined))?.mtimeMs ?? 0
++        if (modified > newest) newest = modified
++      }
++    }
++  } catch { return undefined }
++  return newest && now - newest <= CLAUDE_ACTIVE_MS ? new Date(newest).toISOString() : undefined
++}
++
+ // ---------------------------------------------------------------------------
+ // Office
+ 
+@@ -825,6 +859,7 @@ export function agentRoster(runtime: RuntimeSnapshot): AgentSpec[] {
+   const profiles = runtime.profiles.availability === 'available' ? runtime.profiles.data : []
+   const agents: AgentSpec[] = profiles.filter((profile) => PROFILE_NAME.test(profile.name)).map((profile) => ({ id: profile.name, role: 'Hermes profile', profile: profile.name, gateway: profile.gateway, aliases: [profile.name.toLowerCase()] }))
+   if (runtime.openCode.availability === 'available' && !agents.some((agent) => agent.id === 'opencode')) agents.push({ id: 'opencode', role: 'OpenCode', aliases: ['opencode', 'open-code'] })
++  if (runtime.claudeCode?.availability === 'available' && !agents.some((agent) => agent.id === 'claude-code')) agents.push({ id: 'claude-code', role: 'Claude Code', aliases: ['claude-code', 'claude'] })
+   return agents
+ }
+ 
+@@ -889,6 +924,10 @@ export function buildOfficeSummary(stations: OfficeStation[], runtime: RuntimeSn
+ 
+ function liveState(agent: AgentSpec, snapshot: AgentActivitySnapshot | undefined): { state: OfficeState; probe?: AgentActivity; known: boolean } {
+   if (!snapshot) return { state: 'Unknown', known: true }
++  if (agent.id === 'claude-code') {
++    // Claude Code has no Hermes profile; it works when a session transcript was written to recently.
++    return { state: snapshot.claudeCodeLastSeen ? 'Working' : 'Unknown', probe: snapshot.claudeCodeLastSeen ? { profile: 'claude-code', availability: 'available', active: true, kind: 'tools', label: 'Coding with Claude Code', lastSeen: snapshot.claudeCodeLastSeen, mentionsOpenCode: false } : undefined, known: true }
++  }
+   if (!agent.profile) {
+     // OpenCode has no Hermes profile; it counts as working when an agent's recent log shows it being driven.
+     const driver = snapshot.agents.find((agent) => agent.mentionsOpenCode)
+@@ -930,9 +969,9 @@ export function buildOfficeSnapshot(runtime: RuntimeSnapshot, board: TaskBoardSn
+     const recentActivity = live.probe
+       ? live.probe.active ? `${live.probe.label ?? 'Active'}${live.probe.lastSeen ? ` (last log ${live.probe.lastSeen})` : ''}` : `No activity in the last ${ACTIVITY_WINDOW}`
+       : activity.sessions.availability === 'unavailable' ? 'Not Available' : collaboration === 'Collaborating' ? 'Attributed active collaboration session' : 'No attributed recent activity'
+-    const runtimeProvenance = agent.profile ? `Gateway ${gateway ?? 'Unknown'} (hermes profile list)` : 'OpenCode version availability is not a state signal'
++    const runtimeProvenance = agent.profile ? `Gateway ${gateway ?? 'Unknown'} (hermes profile list)` : agent.id === 'claude-code' ? 'Claude Code version availability is not a state signal' : 'OpenCode version availability is not a state signal'
+     const managedIdle = state === 'Idle' ? '; Ruang managed-idle placement policy (not agent-reported presence)' : ''
+-    const liveProvenance = options.agentActivity ? `; live activity (${agent.profile ? `hermes -p ${agent.profile} logs/sessions` : 'agent logs mentioning OpenCode'}, last ${ACTIVITY_WINDOW}): ${!agentActivity || !live.known ? 'unavailable' : live.state !== 'Unknown' ? live.probe?.kind ?? 'active' : 'none'}` : ''
++    const liveProvenance = options.agentActivity ? `; live activity (${agent.profile ? `hermes -p ${agent.profile} logs/sessions` : agent.id === 'claude-code' ? '~/.claude/projects transcripts' : 'agent logs mentioning OpenCode'}, last ${ACTIVITY_WINDOW}): ${!agentActivity || !live.known ? 'unavailable' : live.state !== 'Unknown' ? live.probe?.kind ?? 'active' : 'none'}` : ''
+     return {
+       id: agent.id,
+       name: agent.id,
+@@ -1008,7 +1047,11 @@ export function getUsage(days: number, now = Date.now()): Promise<UsageSnapshot>
+ const logsSource = cachedSource(() => collectLogs(), 5_000)
+ const agentActivitySource = cachedSource(async () => {
+   const runtime = await getSnapshot()
+-  return collectAgentActivity(runtime.profiles.availability === 'available' ? runtime.profiles.data.map((profile) => profile.name) : [])
++  const [snapshot, claudeCodeLastSeen] = await Promise.all([
++    collectAgentActivity(runtime.profiles.availability === 'available' ? runtime.profiles.data.map((profile) => profile.name) : []),
++    runtime.claudeCode?.availability === 'available' ? collectClaudeCodeActivity() : undefined,
++  ])
++  return claudeCodeLastSeen ? { ...snapshot, claudeCodeLastSeen } : snapshot
+ }, 15_000)
+ 
+ export function getSnapshot(now = Date.now()): Promise<RuntimeSnapshot> { return runtimeSource(now) }
+diff --git a/src/pages/Agents.tsx b/src/pages/Agents.tsx
+index 0b3a3e6..00c54e8 100644
+--- a/src/pages/Agents.tsx
++++ b/src/pages/Agents.tsx
+@@ -11,11 +11,13 @@ export function Agents({ runtime, pending = false }: { runtime: RuntimeSnapshot
+   if (!runtime || runtime.profiles.availability === 'unavailable') return <><PageTitle eyebrow="CREW" title="Agents"/><EmptyState title="Not Available">The Hermes profile list could not be read. Is <code>hermes</code> on the PATH of the server?</EmptyState></>
+   const states = new Map(office.status === 'ready' ? office.data.stations.map((station) => [station.id, station]) : [])
+   const openCode = runtime.openCode.availability === 'available' ? runtime.openCode.data : undefined
++  const claudeCode = runtime.claudeCode?.availability === 'available' ? runtime.claudeCode.data : undefined
+   const cards = [
+     ...runtime.profiles.data.map((profile) => ({ id: profile.name, kind: 'Hermes profile', model: profile.model, gateway: profile.gateway })),
+     ...(openCode ? [{ id: 'opencode', kind: 'OpenCode (CLI tool)', model: openCode, gateway: undefined }] : []),
++    ...(claudeCode ? [{ id: 'claude-code', kind: 'Claude Code (CLI tool)', model: claudeCode, gateway: undefined }] : []),
+   ]
+-  return <><PageTitle eyebrow="CREW" title="Agents">Every Hermes profile on this machine (from <code>hermes profile list</code>) is an agent{openCode ? ', plus OpenCode' : ''}. Nothing is configured by hand: new profiles appear here and in the office automatically.</PageTitle>
++  return <><PageTitle eyebrow="CREW" title="Agents">Every Hermes profile on this machine (from <code>hermes profile list</code>) is an agent{openCode ? ', plus OpenCode' : ''}{claudeCode ? `${openCode ? ' and' : ', plus'} Claude Code` : ''}. Nothing is configured by hand: new profiles appear here and in the office automatically.</PageTitle>
+     <section className="agent-grid">{cards.map((card) => {
+       const station = states.get(card.id)
+       return <article className="agent-card" key={card.id}>
+diff --git a/src/pages/Memory.tsx b/src/pages/Memory.tsx
+index 3a5818f..e938afa 100644
+--- a/src/pages/Memory.tsx
++++ b/src/pages/Memory.tsx
+@@ -97,7 +97,7 @@ export function Memory({ onOpenFolders }: { onOpenFolders?: () => void }) {
+         const peak = Math.max(item.memory?.percent ?? 0, item.user?.percent ?? 0)
+         return <button key={item.profile} role="tab" aria-selected={item.profile === agent.profile} className={`memory-tab${item.profile === agent.profile ? ' active' : ''}`} onClick={() => setSelected(item.profile)} disabled={!item.available && !item.locked}>
+           <span className="folder-glyph small" aria-hidden="true"><PixelCharacter agent={item.profile}/></span>
+-          <span><strong>{item.locked ? '🔒 ' : ''}{item.label}</strong><small>{!item.available ? item.reason ?? 'not available' : item.kind === 'opencode' ? `${item.contextFiles.length} rules file(s)` : `${(item.memory?.entries.length ?? 0) + (item.user?.entries.length ?? 0)} entries · ${peak}% peak`}</small></span>
++          <span><strong>{item.locked ? '🔒 ' : ''}{item.label}</strong><small>{!item.available ? item.reason ?? 'not available' : item.kind !== 'hermes' ? `${item.contextFiles.length} rules file(s)` : `${(item.memory?.entries.length ?? 0) + (item.user?.entries.length ?? 0)} entries · ${peak}% peak`}</small></span>
+         </button>
+       })}</div>
+       <PrivateGate agent={agent.profile}>{agent.locked ? <ProfileUnlock agent={agent.profile}/> : <AgentPanel key={agent.profile} agent={agent} onOpenFolders={onOpenFolders}/>}</PrivateGate>
+diff --git a/src/pages/ProfileLockSettings.tsx b/src/pages/ProfileLockSettings.tsx
+index 9f4a388..afbfcc7 100644
+--- a/src/pages/ProfileLockSettings.tsx
++++ b/src/pages/ProfileLockSettings.tsx
+@@ -15,6 +15,7 @@ export function ProfileLockSettings() {
+   const agents = runtime.status === 'ready' ? [
+     ...(runtime.data.profiles.availability === 'available' ? runtime.data.profiles.data.map((profile) => profile.name) : []),
+     ...(runtime.data.openCode.availability === 'available' ? ['opencode'] : []),
++    ...(runtime.data.claudeCode?.availability === 'available' ? ['claude-code'] : []),
+   ] : []
+   const finish = (text: string) => () => { setMode('idle'); setMessage(text) }
+   const start = (next: Mode) => () => { setMessage(undefined); setMode(next) }
+diff --git a/src/types.ts b/src/types.ts
+index 0fb2f48..cc314bf 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -5,6 +5,7 @@ export interface RuntimeSnapshot {
+   /** Every Hermes profile is an agent; `gateway` comes from `hermes profile list`. */
+   profiles: Source<{ name: string; model: string; gateway: GatewayState }[]>
+   openCode: Source<string>
++  claudeCode?: Source<string>
+   fetchedAt: string
+ }
+ export interface Task { title: string; status: string; id?: string; assignee?: string; priority?: number; board?: string; private?: boolean }
+@@ -118,5 +119,5 @@ export interface TaskDetailSnapshot { task: Source<TaskDetail | null>; fetchedAt
+ export interface MemoryDocument { name: string; path: string; exists: boolean; size?: number; modified?: string; chars?: number; content?: string; truncated?: boolean; redactions?: number; error?: string }
+ export interface MemoryStore extends MemoryDocument { entries: string[]; limit: number; used: number; percent: number }
+ export interface MemorySettings { memoryEnabled: boolean; userProfileEnabled: boolean; writeApproval: boolean; provider?: string; memoryLimit: number; userLimit: number; source: 'config.yaml' | 'defaults' }
+-export interface AgentMemory { profile: string; label: string; path: string; kind: 'hermes' | 'opencode'; available: boolean; reason?: string; soul?: MemoryDocument; memory?: MemoryStore; user?: MemoryStore; contextFiles: MemoryDocument[]; settings?: MemorySettings; locked?: boolean }
++export interface AgentMemory { profile: string; label: string; path: string; kind: 'hermes' | 'opencode' | 'claude-code'; available: boolean; reason?: string; soul?: MemoryDocument; memory?: MemoryStore; user?: MemoryStore; contextFiles: MemoryDocument[]; settings?: MemorySettings; locked?: boolean }
+ export interface MemorySnapshot { agents: AgentMemory[]; fetchedAt: string }
