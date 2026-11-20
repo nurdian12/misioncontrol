@@ -9,13 +9,11 @@ foreach ($tool in 'git', 'node', 'npm') {
 }
 if ([int](node -p "process.versions.node.split('.')[0]") -lt 20) { throw "Butuh Node.js 20 atau lebih baru (ada: $(node -v))." }
 
-if (Test-Path "$Dir\.git") {
-  Write-Host "Memperbarui $Dir"
-  git -C $Dir checkout -q -- .
-  git -C $Dir pull -q --ff-only
-} else {
-  git clone -q -c core.autocrlf=false https://github.com/yugienugraha/ruang.git $Dir
-}
+Write-Host "Skrip versi 3 (patch base64, clone baru)"
+# Selalu mulai dari clone bersih supaya patch tidak bentrok dengan sisa percobaan sebelumnya.
+if (Test-Path $Dir) { Remove-Item -Recurse -Force $Dir }
+git clone -q -c core.autocrlf=false https://github.com/yugienugraha/ruang.git $Dir
+if ($LASTEXITCODE -ne 0) { throw "git clone gagal." }
 
 $patchFile = Join-Path $env:TEMP 'ruang-claude-code.patch'
 # Patch disimpan sebagai base64 (ASCII murni) supaya aman dari masalah encoding file .ps1.
@@ -324,8 +322,12 @@ IGludGVyZmFjZSBNZW1vcnlTbmFwc2hvdCB7IGFnZW50czogQWdlbnRNZW1vcnlbXTsgZmV0Y2hlZEF0
 [IO.File]::WriteAllBytes($patchFile, [Convert]::FromBase64String(($patchB64 -replace '\s', '')))
 
 Set-Location $Dir
-git apply --ignore-whitespace $patchFile
-if ($LASTEXITCODE -ne 0) { throw "Patch gagal diterapkan." }
+git apply --ignore-whitespace --whitespace=nowarn $patchFile
+if ($LASTEXITCODE -ne 0) {
+  Write-Host "Commit Ruang: $(git rev-parse HEAD)  ukuran patch: $((Get-Item $patchFile).Length) byte" -ForegroundColor Yellow
+  git apply --check -v --ignore-whitespace $patchFile
+  throw "Patch gagal diterapkan. Kirim tampilan layar ini."
+}
 npm install --no-audit --no-fund
 npm run build
 if ($LASTEXITCODE -ne 0) { throw "Build gagal." }
