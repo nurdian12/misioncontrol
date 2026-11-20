@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "skills": {
+    "session-story": {
+      "source": "heygen-com/hyperframes-community-skills",
+      "commit": "ba7a0bb6d3567d124c51f6074625043bfe0b32eb",
+      "sourceType": "github",
+      "skillPath": "skills/session-story/SKILL.md",
+      "computedHash": "e921510479567dd52bb636b6646a4f2e5b07f1418fd3839748b5dcd073163773"
+    }
+  }
+}
